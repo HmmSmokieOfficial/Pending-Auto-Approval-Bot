@@ -26,13 +26,13 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-API_ID = "26490815"
-API_HASH = "b99d8504b8812f9ec395ec61c010ac32"
-BOT_TOKEN = "7776443697:AAE-TzaAT7l8H8UsamPR3o-k3K_0H79KGCE"
-SESSION_STRING = "BQGfjM8AcnBHOyj-eKRTbttTseAGRhWmxKbljsd-IDYKyATeRWDDMAqK1IezrjwcFejDFstCZaFvxXIHL_frIXTQb-2qS3QOMHswYE7uABfZ04imELXj9i1PrmsSAEz3-2X8OYPyQav998AyGxJDRhoO8-D64WBPaFrJdjzwms7dV4kKGzZhujkhF3wh6AiqS7yXIkK5RxXxz57HomWfbQpKJ-qxam08Yoy2bdWh92qo3saMwNAPNAT60dQu8znRoUWJDA7cv94NCMz9KwA9w689-L1hYqtOceushyDN0JnhbSEhvdO738xBv1P0ZfBW0rlO6uryx-TSnXh6A_rN1wqbIJi2PAAAAAE9CjtJAA"
-LOG_GROUP_ID = "-1001806351030"
+API_ID = ""
+API_HASH = ""
+BOT_TOKEN = ""
+SESSION_STRING = ""
+LOG_GROUP_ID = ""
 # MongoDB configuration
-MONGO_URL = "mongodb+srv://hmmSmokie:Saurabh0001@smokie.ibkld.mongodb.net/ApprovalDatabase?retryWrites=true&w=majority&appName=Smokie"
+MONGO_URL = ""
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
 db = client.ApprovalDatabase
 queue_collection = db.approve_queue
