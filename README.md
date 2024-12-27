@@ -120,8 +120,6 @@ Robust error management including:
 
 ## Contact
 
-
-
 - Telegram: https://t.me/hmm_Smokie
 - GitHub: [(https://github.com/thefinegraphicsroom)]
 
