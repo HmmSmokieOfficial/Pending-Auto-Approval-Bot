@@ -24,8 +24,7 @@ This Telegram bot automatically handles join requests for channels and groups, p
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/telegram-auto-approver-bot.git
-cd telegram-auto-approver-bot
+git clone https://github.com/HmmSmokieOfficial/Pending-Auto-Approval-Bot.git
 ```
 
 2. Install required dependencies:
@@ -38,6 +37,7 @@ pip install pyrogram tgcrypto
 export TELEGRAM_API_ID=your_api_id
 export TELEGRAM_API_HASH=your_api_hash
 export TELEGRAM_BOT_TOKEN=your_bot_token
+export SESSION_STRING=assistant_session_string
 ```
 
 ## Configuration
@@ -52,19 +52,24 @@ Required environment variables:
 - `TELEGRAM_API_ID`: Your Telegram API ID
 - `TELEGRAM_API_HASH`: Your Telegram API Hash
 - `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token
+- `SESSION_STRING`: Assistant Session String
 
 ## Database
 
-The bot uses JSON files to store:
-- User information (`users_database.json`)
-- Channel information (`channels_database.json`)
-- Group information (`groups_database.json`)
+The bot uses Mongo db files to store:
+- User information (`users_database`)
+- Channel information (`channels_database`)
+- Group information (`groups_database`)
 
 ## Main Functions
 
 - `/start`: Bot initialization and welcome message
 - `/broadcast`: Send messages to all users
 - `/broadcastgrp`: Send messages to all groups
+- `/addassistant`: To add assistant in group or channel
+- `/approve`: to approve pending request
+- `/auth`: to auth the channel or group for accepting request
+- `/uauth`: to unauth channel or group for stop accept new request
 - Automatic join request handling
 
 ## Broadcast Capabilities
@@ -114,6 +119,8 @@ Robust error management including:
 [Specify your license, e.g., MIT License]
 
 ## Contact
+
+
 
 - Telegram: https://t.me/hmm_Smokie
 - GitHub: [(https://github.com/thefinegraphicsroom)]
