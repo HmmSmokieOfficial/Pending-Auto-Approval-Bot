@@ -1,2 +1,5 @@
 pyrofork
 motor
+pyrogram
+tgcrypto
+pymongo
