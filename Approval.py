@@ -1156,7 +1156,7 @@ async def start_command(client: Client, message: Message):
         [InlineKeyboardButton("➕ Add me to your channel", url=f"https://t.me/{bot_username}?startchannel=true")],
         [InlineKeyboardButton("➕ Add me to your Group", url=f"https://t.me/{bot_username}?startgroup=true")],
         [
-            InlineKeyboardButton("👥 Support", url="https://t.me/SmokieOfficial"),
+            InlineKeyboardButton("👥 Support", url="https://t.me/BotCodeVerse"),
             InlineKeyboardButton("👨‍💻 Owner", url="https://t.me/Hmm_Smokie")
         ]
     ])
