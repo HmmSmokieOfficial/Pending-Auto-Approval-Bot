@@ -26,13 +26,13 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-API_ID = ""
-API_HASH = ""
-BOT_TOKEN = ""
-SESSION_STRING = ""
-LOG_GROUP_ID = ""
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SESSION_STRING = os.getenv("SESSION_STRING")
+LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID"))
 # MongoDB configuration
-MONGO_URL = ""
+MONGO_URL = os.getenv("MONGO_URL")
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
 db = client.ApprovalDatabase
 queue_collection = db.approve_queue
