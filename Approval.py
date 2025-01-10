@@ -1149,11 +1149,17 @@ async def start_command(client: Client, message: Message):
             "To get started, add me to your channel/group as an admin with 'Invite Users' permission! 🚀"
         )
 
+        bot_username = (await client.get_me()).username
+
         # Create inline keyboard with support channel button
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Support Channel", url="https://t.me/SmokieOfficial")]
-        ])
-
+        [InlineKeyboardButton("➕ Add me to your channel", url=f"https://t.me/{bot_username}?startchannel=true")],
+        [InlineKeyboardButton("➕ Add me to your Group", url=f"https://t.me/{bot_username}?startgroup=true")],
+        [
+            InlineKeyboardButton("👥 Support", url="https://t.me/SmokieOfficial"),
+            InlineKeyboardButton("👨‍💻 Owner", url="https://t.me/Hmm_Smokie")
+        ]
+    ])
         # Send welcome video with caption
         await client.send_video(
             chat_id=message.chat.id,
