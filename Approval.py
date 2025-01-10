@@ -52,6 +52,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+user = None
+
 def get_current_session_string():
     """Get the current session string from MongoDB or environment variable"""
     session_doc = assistant_collection.find_one({"type": "current_session"})
@@ -66,6 +68,7 @@ try:
         bot_token=BOT_TOKEN
     )
     current_session = get_current_session_string()
+    # Now initialize the global user variable
     user = Client(
         "user_session",
         session_string=current_session
@@ -74,6 +77,98 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize clients: {str(e)}")
     raise
+
+@bot.on_message(filters.command('changestring') & filters.private)
+async def change_string_session(client: Client, message: Message):
+    """Handle changing the assistant's session string"""
+    try:
+        # Check if user is authorized (bot owner)
+        if message.from_user.id != 1949883614:  # Your user ID
+            await message.reply_text("⛔️ This command is only for the bot owner.")
+            return
+
+        # Check command format
+        args = message.text.split(None, 1)
+        if len(args) != 2:
+            await message.reply_text(
+                "❗️ Please provide the new session string.\n\n"
+                "Usage: /changestring <new_session_string>"
+            )
+            return
+
+        new_session = args[1].strip()
+
+        # Delete the command message for security
+        try:
+            await message.delete()
+        except Exception as e:
+            logger.warning(f"Could not delete session string message: {e}")
+
+        status_msg = await message.reply_text("🔄 Changing assistant session...")
+
+        try:
+            global user  # Now the global declaration is before any use
+            # Stop the current user client
+            await user.stop()
+
+            # Create new client with new session
+            user = Client(
+                "user_session",
+                session_string=new_session
+            )
+
+            # Test the new session
+            await user.start()
+            assistant_info = await user.get_me()
+
+            # Update success message
+            await status_msg.edit_text(
+                f"✅ Successfully changed assistant account!\n\n"
+                f"New Assistant Details:\n"
+                f"• Username: @{assistant_info.username}\n"
+                f"• ID: `{assistant_info.id}`\n\n"
+                "ℹ️ The bot will now use this account for all assistant operations."
+            )
+
+            # Log the change
+            logger.info(f"Assistant session changed to account: {assistant_info.id}")
+            
+            # Store new session info in MongoDB for persistence
+            assistant_collection.update_one(
+                {"type": "current_session"},
+                {
+                    "$set": {
+                        "session_string": new_session,
+                        "assistant_id": assistant_info.id,
+                        "assistant_username": assistant_info.username,
+                        "updated_at": datetime.now(timezone.utc)
+                    }
+                },
+                upsert=True
+            )
+
+        except Exception as e:
+            # If anything goes wrong, try to restore the old session
+            logger.error(f"Error changing session: {e}")
+            try:
+                if user:
+                    await user.stop()
+                user = Client(
+                    "user_session",
+                    session_string=SESSION_STRING
+                )
+                await user.start()
+            except Exception as restore_error:
+                logger.error(f"Error restoring original session: {restore_error}")
+
+            await status_msg.edit_text(
+                f"❌ Failed to change assistant session: {str(e)}\n"
+                "The previous session has been restored."
+            )
+
+    except Exception as e:
+        logger.error(f"Error in change_string_session: {str(e)}")
+        await message.reply_text("❌ An unexpected error occurred while changing the session.")
 
 class QueueStatus(Enum):
     PENDING = "pending"
@@ -504,98 +599,6 @@ async def extract_chat_id(message):
     except Exception as e:
         logger.error(f"Error extracting chat ID from message: {message.text}, Error: {str(e)}")
         return None
-
-@bot.on_message(filters.command('changestring') & filters.private)
-async def change_string_session(client: Client, message: Message):
-    """Handle changing the assistant's session string"""
-    try:
-        # Check if user is authorized (bot owner)
-        if message.from_user.id != 1949883614:  # Your user ID
-            await message.reply_text("⛔️ This command is only for the bot owner.")
-            return
-
-        # Check command format
-        args = message.text.split(None, 1)
-        if len(args) != 2:
-            await message.reply_text(
-                "❗️ Please provide the new session string.\n\n"
-                "Usage: /changestring <new_session_string>"
-            )
-            return
-
-        new_session = args[1].strip()
-
-        # Delete the command message for security
-        try:
-            await message.delete()
-        except Exception as e:
-            logger.warning(f"Could not delete session string message: {e}")
-
-        status_msg = await message.reply_text("🔄 Changing assistant session...")
-
-        try:
-            # Stop the current user client
-            await user.stop()
-
-            # Create new client with new session
-            global user  # Access the global user variable
-            user = Client(
-                "user_session",
-                session_string=new_session
-            )
-
-            # Test the new session
-            await user.start()
-            assistant_info = await user.get_me()
-
-            # Update success message
-            await status_msg.edit_text(
-                f"✅ Successfully changed assistant account!\n\n"
-                f"New Assistant Details:\n"
-                f"• Username: @{assistant_info.username}\n"
-                f"• ID: `{assistant_info.id}`\n\n"
-                "ℹ️ The bot will now use this account for all assistant operations."
-            )
-
-            # Log the change
-            logger.info(f"Assistant session changed to account: {assistant_info.id}")
-            
-            # Store new session info in MongoDB for persistence
-            assistant_collection.update_one(
-                {"type": "current_session"},
-                {
-                    "$set": {
-                        "session_string": new_session,
-                        "assistant_id": assistant_info.id,
-                        "assistant_username": assistant_info.username,
-                        "updated_at": datetime.now(timezone.utc)
-                    }
-                },
-                upsert=True
-            )
-
-        except Exception as e:
-            # If anything goes wrong, try to restore the old session
-            logger.error(f"Error changing session: {e}")
-            try:
-                if 'user' in globals():
-                    await user.stop()
-                user = Client(
-                    "user_session",
-                    session_string=SESSION_STRING
-                )
-                await user.start()
-            except Exception as restore_error:
-                logger.error(f"Error restoring original session: {restore_error}")
-
-            await status_msg.edit_text(
-                f"❌ Failed to change assistant session: {str(e)}\n"
-                "The previous session has been restored."
-            )
-
-    except Exception as e:
-        logger.error(f"Error in change_string_session: {str(e)}")
-        await message.reply_text("❌ An unexpected error occurred while changing the session.")
 
 @bot.on_message(filters.command('addassistant') & filters.private)
 @handle_flood_wait
