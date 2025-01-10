@@ -1,1443 +1,1356 @@
 import logging
-import sys
-import asyncio
+import os
+import traceback
+from datetime import datetime, timedelta
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, ChatJoinRequest
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import MessageDeleteForbidden, ChannelInvalid, InviteRequestSent
-from pyrogram.errors import ChatAdminRequired, UserAlreadyParticipant, FloodWait
-import motor.motor_asyncio
-from datetime import datetime, UTC, timedelta
-import time
-from collections import deque
-from dataclasses import dataclass
-from typing import Optional
-from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked, PeerIdInvalid
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
+from pyrogram.errors import (
+    ChatAdminRequired,
+    UserNotParticipant,
+    ChannelPrivate,
+    ChatWriteForbidden,
+    FloodWait,
+    RPCError
 )
-
-logger = logging.getLogger(__name__)
+import asyncio
+from functools import wraps
+from pymongo import MongoClient
+from datetime import datetime, timezone 
+from enum import Enum
+from typing import Tuple, List, Dict
+from pyrogram.errors import (
+    InputUserDeactivated,
+    UserIsBlocked,
+    PeerIdInvalid,
+    UserDeactivated,
+    FloodWait
+)
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SESSION_STRING = os.getenv("SESSION_STRING")
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID"))
-# MongoDB configuration
-MONGO_URL = os.getenv("MONGO_URL")
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
-db = client.ApprovalDatabase
-queue_collection = db.approve_queue
-active_jobs_collection = db.active_jobs
-user_collection = db.users
-assistant_data_collection = db.assistant_data
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI)
+db = client.ApproveBot
+chats_collection = db.authorized_chats
+assistant_collection = db.assistant_data
+users_collection = db.users
+approved_users_collection = db.approved_users
+queue_collection = db.approval_queue
 
-DELETE_DELAY = 10  # Delay in seconds before deleting messages
-APPROVE_DELAY = 3  # Delay in seconds between approving requests
-
-bot = Client(
-    "approvebot", 
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'bot_logs_{datetime.now().strftime("%Y%m%d")}.log'),
+        logging.StreamHandler()
+    ]
 )
+logger = logging.getLogger(__name__)
 
-user = Client(
-    "user_session",
-    session_string=SESSION_STRING
-)
-
-async def send_log(message: str):
-    """Send log message to the designated logging group"""
-    try:
-        await bot.send_message(LOG_GROUP_ID, message)
-    except Exception as e:
-        logger.error(f"Failed to send log message: {e}")
-
-# Database utility functions
-async def is_chat_authorized(chat_id):
-    chat = await db.authorized_chats.find_one({"chat_id": chat_id})
-    return bool(chat and chat.get("is_authorized", False))
-
-async def authorize_chat(chat_id, chat_title, authorized_by):
-    try:
-        await db.authorized_chats.update_one(
-            {"chat_id": chat_id},
-            {
-                "$set": {
-                    "chat_id": chat_id,
-                    "chat_title": chat_title,
-                    "is_authorized": True,
-                    "authorized_by": authorized_by,
-                    "authorized_at": datetime.now(UTC)
-                }
-            },
-            upsert=True
-        )
-        
-        # Send log message
-        auth_info = f"@{authorized_by['username']}" if authorized_by['username'] else authorized_by['full_name']
-        await send_log(
-            f"✅ Chat Authorized\n"
-            f"📢 Chat: {chat_title}\n"
-            f"🆔 Chat ID: `{chat_id}`\n"
-            f"👤 Authorized By: {auth_info}"
-        )
-    except Exception as e:
-        logger.error(f"Error in authorize_chat: {e}")
-
-
-async def unauthorize_chat(chat_id):
-    try:
-        chat = await bot.get_chat(chat_id)
-        await db.authorized_chats.update_one(
-            {"chat_id": chat_id},
-            {"$set": {"is_authorized": False}}
-        )
-        
-        # Send log message
-        await send_log(
-            f"❌ Chat Unauthorized\n"
-            f"📢 Chat: {chat.title}\n"
-            f"🆔 Chat ID: `{chat_id}`"
-        )
-    except Exception as e:
-        logger.error(f"Error in unauthorize_chat: {e}")
-
-async def log_approved_user(user_id, user_name, chat_id, chat_title, approved_by):
-    """
-    Log or update approved user information in the database.
-    If user already exists in the chat, update their entry instead of creating a new one.
-    """
-    try:
-        # Check if user already exists in this chat
-        existing_entry = await db.approved_users.find_one({
-            "user_id": user_id,
-            "chat_id": chat_id
-        })
-
-        if existing_entry:
-            # Update existing entry
-            await db.approved_users.update_one(
-                {
-                    "user_id": user_id,
-                    "chat_id": chat_id
-                },
-                {
-                    "$set": {
-                        "user_name": user_name,  # Update in case username changed
-                        "chat_title": chat_title,  # Update in case chat title changed
-                        "approved_by": approved_by,
-                        "approved_at": datetime.now(UTC),
-                        "approval_count": (existing_entry.get("approval_count", 1) + 1)
-                    }
-                }
-            )
-        else:
-            # Create new entry
-            await db.approved_users.insert_one({
-                "user_id": user_id,
-                "user_name": user_name,
-                "chat_id": chat_id,
-                "chat_title": chat_title,
-                "approved_by": approved_by,
-                "approved_at": datetime.now(UTC),
-                "approval_count": 1
-            })
-
-    except Exception as e:
-        logger.error(f"Error in log_approved_user: {str(e)}")
-
-async def add_to_queue(chat_id: int, chat_title: str, requested_by: Optional[int] = None):
-    try:
-        existing_entry = await queue_collection.find_one({"chat_id": chat_id})
-        current_time = datetime.now(UTC)
-        
-        if existing_entry and existing_entry['status'] not in ['pending', 'processing']:
-            await queue_collection.update_one(
-                {"chat_id": chat_id},
-                {
-                    "$set": {
-                        "chat_title": chat_title,
-                        "requested_by": requested_by,
-                        "status": "pending",
-                        "created_at": current_time,
-                        "started_at": None,
-                        "completed_at": None,
-                        "error": None,
-                        "approved_count": 0,
-                        "skipped_count": 0
-                    }
-                }
-            )
-        elif not existing_entry:
-            await queue_collection.insert_one({
-                "chat_id": chat_id,
-                "chat_title": chat_title,
-                "requested_by": requested_by,
-                "status": "pending",
-                "created_at": current_time,
-                "started_at": None,
-                "completed_at": None,
-                "error": None,
-                "approved_count": 0,
-                "skipped_count": 0
-            })
-            
-        # Get queue position
-        position = await get_queue_position(chat_id)
-        
-        # Send log message
-        await send_log(
-            f"📝 New Queue Entry\n"
-            f"📢 Chat: {chat_title}\n"
-            f"🆔 Chat ID: `{chat_id}`\n"
-            f"📊 Queue Position: {position}\n"
-            f"👤 Requested By: `{requested_by if requested_by else 'Channel Admin'}`"
-        )
-    except Exception as e:
-        logger.error(f"Error adding to queue: {e}")
-
-async def get_next_in_queue() -> Optional[dict]:
-    """Get the next pending request in queue"""
-    return await queue_collection.find_one(
-        {
-            "status": "pending",
-            # Optionally add a condition to exclude entries that were recently processed
-            "completed_at": None
-        },
-        sort=[("created_at", 1)]  # Get oldest request first
+# Initialize clients with error handling
+try:
+    bot = Client(
+        "approvebot", 
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN
     )
-
-async def update_queue_status(queue_id, status: str, **kwargs):
-    """Update the status of a queued request"""
-    update_data = {"status": status}
-    update_data.update(kwargs)
-    
-    if status == "processing":
-        update_data["started_at"] = datetime.now(UTC)
-    elif status in ["completed", "failed"]:
-        update_data["completed_at"] = datetime.now(UTC)
-    
-    await queue_collection.update_one(
-        {"_id": queue_id},
-        {"$set": update_data}
+    user = Client(
+        "user_session",
+        session_string=SESSION_STRING
     )
+    logger.info("Clients initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize clients: {str(e)}")
+    raise
 
-async def is_approval_in_progress():
-    """Check if there's an active approval process running"""
-    active_job = await active_jobs_collection.find_one(
-        {"type": "approve", "active": True}
-    )
-    return bool(active_job)
+class QueueStatus(Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
-async def set_approval_status(is_active: bool):
-    """Set the status of approval process"""
-    if is_active:
-        await active_jobs_collection.update_one(
-            {"type": "approve"},
-            {
-                "$set": {
-                    "active": True,
-                    "last_updated": datetime.now(UTC)
-                }
-            },
-            upsert=True
-        )
-    else:
-        await active_jobs_collection.delete_one({"type": "approve"})
-
-async def get_queue_position(chat_id: int) -> int:
-    """Get position in queue for a specific chat"""
-    try:
-        # Get the current chat's entry
-        current_entry = await queue_collection.find_one({"chat_id": chat_id})
-        if not current_entry:
-            return 0
-            
-        # Count only pending entries that were created before this one
-        position = await queue_collection.count_documents({
-            "status": "pending",
-            "created_at": {"$lt": current_entry["created_at"]}
-        })
-        return position + 1
-    except Exception as e:
-        logger.error(f"Error getting queue position: {e}")
-        return 1 
-
-
-async def send_notification(chat_id: int, message: str, delete_after: int = None):
-    """Send notification message with optional auto-delete"""
-    try:
-        msg = await bot.send_message(chat_id=chat_id, text=message)
-        if delete_after:
-            asyncio.create_task(delete_messages_with_delay(None, msg))
-        return msg
-    except Exception as e:
-        logger.error(f"Failed to send notification to {chat_id}: {e}")
-        return None
-
-async def process_queue():
-    """Process pending requests in the queue"""
-    while True:
+class QueueManager:
+    def __init__(self):
+        self.processing_lock = asyncio.Lock()
+        
+    async def add_to_queue(self, chat_id: int, admin_id: int, num_requests: int = None):
+        """Add an approval request to the queue"""
         try:
-            if await is_approval_in_progress():
-                await asyncio.sleep(5)
-                continue
-
-            next_request = await get_next_in_queue()
-            if not next_request:
-                await asyncio.sleep(5)
-                continue
-
-            # Delete queue message for the chat that's about to be processed
-            await delete_queue_message(next_request["chat_id"])
-
-            # Update queue positions for remaining chats
-            async for doc in queue_collection.find({"status": "pending"}):
-                if doc["chat_id"] != next_request["chat_id"]:
-                    position = await get_queue_position(doc["chat_id"])
-                    try:
-                        # Delete previous queue message if exists
-                        await delete_queue_message(doc["chat_id"])
-                        
-                        queue_msg = await bot.send_message(
-                            chat_id=doc["chat_id"],
-                            text=f"⏳ Your request is in queue\n📊 Position: {position}\nPlease wait until current process is complete."
-                        )
-                        await save_queue_message(doc["chat_id"], queue_msg.id)
-                    except Exception as e:
-                        logger.error(f"Error updating queue message: {e}")
-
-            # Verify chat exists and is accessible before processing
-            try:
-                chat = await user.get_chat(next_request["chat_id"])
-                if not chat:
-                    raise ChannelInvalid("Channel not found")
-            except Exception as e:
-                logger.error(f"Chat verification failed: {e}")
-                await update_queue_status(
-                    next_request["_id"],
-                    "failed",
-                    error=f"Chat verification failed: {str(e)}"
-                )
-                continue
-
-            await set_approval_status(True)
-            await update_queue_status(next_request["_id"], "processing")
-
-            try:
-                # Send processing notification
-                notification_msg = None
-                try:
-                    notification_msg = await bot.send_message(
-                        chat_id=next_request["chat_id"],
-                        text="🔄 Processing join requests..."
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send processing notification: {e}")
-
-                approved_count, skipped_count = await approve_requests_with_delay(next_request["chat_id"])
-                
-                # Update queue entry with results
-                await update_queue_status(
-                    next_request["_id"],
-                    "completed",
-                    approved_count=approved_count,
-                    skipped_count=skipped_count
-                )
-
-                # Send completion notification
-                completion_msg = f"✅ Queue processed:\n• Approved: {approved_count} request(s)"
-                if skipped_count > 0:
-                    completion_msg += f"\n• Skipped: {skipped_count} request(s)"
-
-                if approved_count > 0 or skipped_count > 0:
-                    await send_log(
-                        f"✅ Queue Processed\n"
-                        f"📢 Chat: {next_request['chat_title']}\n"
-                        f"🆔 Chat ID: `{next_request['chat_id']}`\n"
-                        f"👥 Approved: {approved_count}\n"
-                        f"⏭️ Skipped: {skipped_count}"
-                    )
-                
-                try:
-                    if notification_msg:
-                        final_msg = await notification_msg.edit_text(completion_msg)
-                    else:
-                        final_msg = await bot.send_message(
-                            chat_id=next_request["chat_id"],
-                            text=completion_msg
-                        )
-                    
-                    asyncio.create_task(delete_messages_with_delay(None, final_msg))
-                        
-                except Exception as e:
-                    logger.error(f"Failed to send completion notification: {e}")
-
-            except Exception as e:
-                error_str = str(e)
-                error_message = get_error_message(error_str, next_request["chat_title"])
-                
-                await update_queue_status(
-                    next_request["_id"],
-                    "failed",
-                    error=error_message
-                )
-                
-                try:
-                    if notification_msg:
-                        error_msg = await notification_msg.edit_text(f"❌ Error: {error_message}")
-                    else:
-                        error_msg = await bot.send_message(
-                            chat_id=next_request["chat_id"],
-                            text=f"❌ Error: {error_message}"
-                        )
-                    
-                    asyncio.create_task(delete_messages_with_delay(None, error_msg))
-                        
-                except Exception as notify_error:
-                    logger.error(f"Failed to send error notification: {notify_error}")
-
-            finally:
-                await set_approval_status(False)
-
-        except Exception as e:
-            logger.error(f"Error in queue processing: {e}")
-            await asyncio.sleep(5)
-
-async def save_queue_message(chat_id: int, message_id: int):
-    """Save the queue notification message ID for a chat"""
-    await db.queue_messages.update_one(
-        {"chat_id": chat_id},
-        {
-            "$set": {
-                "message_id": message_id,
-                "updated_at": datetime.now(UTC)
+            # Get current queue position
+            queue_position = queue_collection.count_documents({
+                "status": {"$in": [QueueStatus.PENDING.value, QueueStatus.PROCESSING.value]}
+            }) + 1
+            
+            # Create queue item document
+            queue_item = {
+                "chat_id": chat_id,
+                "admin_id": admin_id,
+                "num_requests": num_requests,
+                "status": QueueStatus.PENDING.value,
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+                "queue_position": queue_position,
+                "attempts": 0,
+                "error_message": None
             }
+            
+            # Insert into collection
+            result = queue_collection.insert_one(queue_item)
+            logger.info(f"Added request to queue: Position {queue_position}, ID {result.inserted_id}")
+            
+            return queue_position, result.inserted_id
+            
+        except Exception as e:
+            logger.error(f"Error adding to queue: {str(e)}")
+            raise
+
+    async def get_next_pending_request(self):
+        """Get the next pending request from the queue"""
+        return queue_collection.find_one_and_update(
+            {
+                "status": QueueStatus.PENDING.value,
+                "attempts": {"$lt": 3}  # Limit retry attempts
+            },
+            {
+                "$set": {
+                    "status": QueueStatus.PROCESSING.value,
+                    "updated_at": datetime.now(timezone.utc)
+                },
+                "$inc": {"attempts": 1}  # Correctly increment attempts
+            },
+            sort=[("queue_position", 1)]
+        )
+
+    async def update_request_status(self, request_id, status: QueueStatus, error_message=None):
+        """Update the status of a queued request"""
+        update_data = {
+            "status": status.value,
+            "updated_at": datetime.now(timezone.utc)
+        }
+        if error_message:
+            update_data["error_message"] = error_message
+            
+        queue_collection.update_one(
+            {"_id": request_id},
+            {"$set": update_data}
+        )
+
+    async def get_queue_position(self, request_id):
+        """Get current position in queue for a request"""
+        request = queue_collection.find_one({"_id": request_id})
+        if not request:
+            return None
+            
+        ahead_in_queue = queue_collection.count_documents({
+            "status": {"$in": [QueueStatus.PENDING.value, QueueStatus.PROCESSING.value]},
+            "queue_position": {"$lt": request["queue_position"]}
+        })
+        return ahead_in_queue + 1
+
+    async def process_queue(self):
+        """Process pending requests in the queue"""
+        while True:
+            async with self.processing_lock:
+                try:
+                    request = await self.get_next_pending_request()
+                    if not request:
+                        await asyncio.sleep(10)  # Wait before checking again
+                        continue
+
+                    # First check if assistant is admin
+                    try:
+                        assistant_info = await user.get_me()
+                        assistant_member = await user.get_chat_member(request["chat_id"], assistant_info.id)
+                        
+                        if not assistant_member.privileges or not assistant_member.privileges.can_invite_users:
+                            error_msg = (
+                                "Assistant requires admin rights with 'Invite Users' permission.\n"
+                                "Please add the assistant as admin first using /addassistant command."
+                            )
+                            await bot.send_message(chat_id=request["admin_id"], text=error_msg)
+                            await self.update_request_status(
+                                request["_id"], 
+                                QueueStatus.FAILED,
+                                error_message="Assistant lacks required admin permissions"
+                            )
+                            continue
+
+                    except UserNotParticipant:
+                        error_msg = (
+                            "Assistant is not a member of this chat.\n"
+                            "Please add the assistant first using /addassistant command."
+                        )
+                        await bot.send_message(chat_id=request["admin_id"], text=error_msg)
+                        await self.update_request_status(
+                            request["_id"],
+                            QueueStatus.FAILED,
+                            error_message="Assistant not in chat"
+                        )
+                        continue
+                        
+                    except Exception as e:
+                        logger.error(f"Error checking assistant status: {str(e)}")
+                        await self.update_request_status(
+                            request["_id"],
+                            QueueStatus.FAILED,
+                            error_message=f"Error checking assistant status: {str(e)}"
+                        )
+                        continue
+
+                    # If we get here, assistant is admin with proper permissions
+                    # Process the request
+                    try:
+                        stats = await approve_requests_internal(
+                            chat_id=request["chat_id"],
+                            admin_id=request["admin_id"],
+                            num_requests=request["num_requests"]
+                        )
+                        
+                        await self.update_request_status(
+                            request["_id"],
+                            QueueStatus.COMPLETED
+                        )
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing queue request: {str(e)}")
+                        await self.update_request_status(
+                            request["_id"],
+                            QueueStatus.FAILED,
+                            error_message=str(e)
+                        )
+                        
+                        await bot.send_message(
+                            chat_id=request["admin_id"],
+                            text=f"❌ Error processing approval request: {str(e)}"
+                        )
+                        
+                except Exception as e:
+                    logger.error(f"Error in queue processing: {str(e)}")
+                    await asyncio.sleep(5)
+
+# Initialize queue manager
+queue_manager = QueueManager()
+
+async def send_log(client, message, action_type=None, extra_info=None):
+    """
+    Send formatted logs to the logging group
+    
+    Args:
+        client: Bot client instance
+        message: Original message that triggered the action
+        action_type: Type of action (e.g., 'start', 'auth', 'unauth', 'approve', 'addassistant')
+        extra_info: Additional information to include in log
+    """
+    try:
+        user = message.from_user
+        user_mention = f"[{user.first_name}](tg://user?id={user.id})"
+        
+        log_text = f"📝 **New Bot Activity**\n"
+        log_text += f"👤 **User:** {user_mention}\n"
+        log_text += f"🆔 **User ID:** `{user.id}`\n"
+        
+        if action_type == "start":
+            log_text += f"📱 **Action:** Started the bot\n"
+            
+        elif action_type in ["auth", "unauth"]:
+            chat_id = message.text.split()[1]
+            try:
+                chat = await client.get_chat(int(chat_id))
+                chat_title = chat.title
+                log_text += f"📱 **Action:** {'Authorized' if action_type == 'auth' else 'Unauthorized'} chat\n"
+                log_text += f"💭 **Chat:** {chat_title}\n"
+                log_text += f"🆔 **Chat ID:** `{chat_id}`\n"
+            except Exception as e:
+                log_text += f"📱 **Action:** Failed {'authorization' if action_type == 'auth' else 'unauthorized'}\n"
+                log_text += f"❌ **Error:** {str(e)}\n"
+                
+        elif action_type == "approve":
+            chat_id = message.text.split()[1]
+            try:
+                chat = await client.get_chat(int(chat_id))
+                chat_title = chat.title
+                log_text += f"📱 **Action:** Approval request\n"
+                log_text += f"💭 **Chat:** {chat_title}\n"
+                log_text += f"🆔 **Chat ID:** `{chat_id}`\n"
+                
+                # Add number of requests if specified
+                if len(message.text.split()) == 3:
+                    num_requests = message.text.split()[2]
+                    log_text += f"📊 **Requests:** {num_requests}\n"
+                
+                # Add approval statistics if provided
+                if extra_info and isinstance(extra_info, dict):
+                    log_text += "\n📊 **Approval Statistics:**\n"
+                    log_text += f"✅ Approved: {extra_info.get('approved_count', 0)}\n"
+                    log_text += f"ℹ️ Already Members: {extra_info.get('already_member_count', 0)}\n"
+                    log_text += f"⚠️ Too Many Channels: {extra_info.get('too_many_channels_count', 0)}\n"
+                    log_text += f"❗️ Deactivated: {extra_info.get('deactivated_count', 0)}\n"
+                    log_text += f"❌ Failed: {extra_info.get('skipped_count', 0)}\n"
+            except Exception as e:
+                log_text += f"📱 **Action:** Failed approval\n"
+                log_text += f"❌ **Error:** {str(e)}\n"
+
+        elif action_type == "addassistant":
+            chat_id = message.text.split()[1]
+            try:
+                chat = await client.get_chat(int(chat_id))
+                chat_title = chat.title
+                log_text += f"📱 **Action:** Add Assistant\n"
+                log_text += f"💭 **Chat:** {chat_title}\n"
+                log_text += f"🆔 **Chat ID:** `{chat_id}`\n"
+                
+                # Add status and additional info if provided
+                if extra_info and isinstance(extra_info, dict):
+                    status = extra_info.get('status', '')
+                    if status == 'success':
+                        log_text += f"✅ **Status:** Successfully added assistant\n"
+                        log_text += f"📌 **Chat Type:** {extra_info.get('chat_type', 'Unknown')}\n"
+                        log_text += f"🤖 **Assistant:** @{extra_info.get('assistant_username', 'Unknown')}\n"
+                    elif status == 'already_participant':
+                        log_text += f"ℹ️ **Status:** Assistant already in chat\n"
+                        log_text += f"🤖 **Assistant:** @{extra_info.get('assistant_username', 'Unknown')}\n"
+                    elif status == 'flood_wait':
+                        log_text += f"⚠️ **Status:** Rate limited\n"
+                        log_text += f"⏳ **Wait Time:** {extra_info.get('wait_time', 'Unknown')} seconds\n"
+                    elif status == 'rpc_error' or status == 'error':
+                        log_text += f"❌ **Status:** Failed\n"
+                        log_text += f"❌ **Error:** {extra_info.get('error', 'Unknown error')}\n"
+                        
+            except Exception as e:
+                log_text += f"📱 **Action:** Failed to add assistant\n"
+                log_text += f"❌ **Error:** {str(e)}\n"
+        
+        # Add timestamp
+        log_text += f"\n⏰ **Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        
+        # Send log message to group
+        await client.send_message(
+            chat_id=LOG_GROUP_ID,
+            text=log_text,
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"Error sending log to group: {str(e)}")
+
+async def is_chat_authorized(chat_id: int) -> bool:
+    """Check if a chat is authorized in MongoDB"""
+    chat_doc = chats_collection.find_one({"chat_id": chat_id})
+    return chat_doc.get("is_authorized", False) if chat_doc else False
+
+async def store_chat_authorization(chat_id: int, chat_title: str, authorized_by: dict, is_authorized: bool):
+    """Store chat authorization status in MongoDB"""
+    chat_doc = {
+        "chat_id": chat_id,
+        "chat_title": chat_title,
+        "authorized_at": datetime.now(timezone.utc),
+        "authorized_by": authorized_by,
+        "is_authorized": is_authorized
+    }
+    
+    # Update or insert the document
+    chats_collection.update_one(
+        {"chat_id": chat_id},
+        {"$set": chat_doc},
+        upsert=True
+    )
+
+async def store_assistant_data(chat_id: int, chat_title: str, added_by: dict, assistant_info: dict, is_active: bool):
+    """Store assistant data in MongoDB"""
+    assistant_doc = {
+        "chat_id": chat_id,
+        "added_by": {
+            "user_id": added_by.id,
+            "username": added_by.username,
+            "first_name": added_by.first_name
+        },
+        "assistant_id": assistant_info.id,
+        "assistant_username": assistant_info.username,
+        "chat_title": chat_title,
+        "is_active": is_active,
+        "added_at": datetime.now(timezone.utc)
+    }
+    
+    # Update or insert the document
+    assistant_collection.update_one(
+        {"chat_id": chat_id},
+        {"$set": assistant_doc},
+        upsert=True
+    )
+
+async def store_user_data(user):
+    """Store user information in MongoDB"""
+    user_doc = {
+        "user_id": user.id,
+        "first_name": user.first_name,
+        "username": user.username,
+        "joined_at": datetime.now(timezone.utc),
+        "last_active": datetime.now(timezone.utc)
+    }
+    
+    # Update or insert the document
+    users_collection.update_one(
+        {"user_id": user.id},
+        {
+            "$set": user_doc,
+            "$setOnInsert": {"first_joined": datetime.now(timezone.utc)}
         },
         upsert=True
     )
 
-async def delete_queue_message(chat_id: int):
-    """Delete the saved queue message for a chat"""
-    queue_message = await db.queue_messages.find_one_and_delete({"chat_id": chat_id})
-    if queue_message:
-        try:
-            await bot.delete_messages(chat_id, queue_message["message_id"])
-        except Exception as e:
-            logger.error(f"Error deleting queue message: {e}")
-
-# Add these new collections after the existing database setup
-user_collection = db.users
-assistant_data_collection = db.assistant_data
-
-async def store_user_data(user):
-    try:
-        await user_collection.update_one(
-            {"user_id": user.id},
-            {
-                "$set": {
-                    "username": user.username,
-                    "first_name": user.first_name,
-                    "last_name": user.last_name,
-                    "last_active": datetime.now(UTC),
-                    "is_bot": user.is_bot
-                },
-                "$setOnInsert": {
-                    "joined_date": datetime.now(UTC)
-                }
-            },
-            upsert=True
-        )
-        
-        # Send log message
-        user_info = f"@{user.username}" if user.username else f"{user.first_name}"
-        await send_log(f"🆕 New User Started Bot\n👤 User: {user_info}\n🆔 ID: `{user.id}`")
-    except Exception as e:
-        logger.error(f"Error storing user data: {e}")
-
-async def store_assistant_data(chat_id: int, chat_title: str, added_by_id: Optional[int] = None):
-    try:
-        assistant_info = await user.get_me()
-        
-        success = await assistant_data_collection.update_one(
-            {"chat_id": chat_id},
-            {
-                "$set": {
-                    "chat_title": chat_title,
-                    "assistant_id": assistant_info.id,
-                    "assistant_username": assistant_info.username,
-                    "last_updated": datetime.now(UTC),
-                    "added_by": added_by_id,
-                    "is_active": True
-                },
-                "$setOnInsert": {
-                    "first_added": datetime.now(UTC)
-                }
-            },
-            upsert=True
-        )
-        
-        # Send log message
-        await send_log(
-            f"➕ Assistant Added to Chat\n"
-            f"📢 Chat: {chat_title}\n"
-            f"🆔 Chat ID: `{chat_id}`\n"
-            f"👤 Added By: `{added_by_id if added_by_id else 'Channel Admin'}`"
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Error storing assistant data: {e}")
-        return False
+async def store_approved_user(user, chat, approval_type):
+    """Store approved user information in MongoDB
     
-async def update_assistant_status(chat_id: int, is_active: bool):
+    Args:
+        user: User object containing user details
+        chat: Chat object containing chat details
+        approval_type: String indicating 'auto_approval' or 'manual_approval'
     """
-    Update the active status of assistant in a chat
-    """
+    approved_user_doc = {
+        "user_id": user.id,
+        "user_name": user.username or user.first_name,  # Fallback to first_name if username is None
+        "chat_id": chat.id,
+        "chat_title": chat.title,
+        "approved_by": approval_type,
+        "approved_at": datetime.now(timezone.utc)
+    }
+    
+    # Insert the document
+    approved_users_collection.insert_one(approved_user_doc)
+
+def handle_flood_wait(func):
+    """Decorator to handle FloodWait errors"""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except FloodWait as e:
+            logger.warning(f"FloodWait encountered: waiting for {e.value} seconds")
+            await asyncio.sleep(e.value)
+            return await func(*args, **kwargs)
+    return wrapper
+
+async def validate_chat(client, chat_id):
+    """Validate chat existence and bot's admin status"""
     try:
-        await assistant_data_collection.update_one(
-            {"chat_id": chat_id},
-            {
-                "$set": {
-                    "is_active": is_active,
-                    "last_updated": datetime.now(UTC)
-                }
+        # First try to get chat info
+        chat = await client.get_chat(chat_id)
+        
+        # Get bot's member info
+        bot_member = await client.get_chat_member(chat_id, (await client.get_me()).id)
+        
+        # Check if bot has the required permissions
+        if not bot_member.privileges or not bot_member.privileges.can_invite_users:
+            return {
+                "valid": False,
+                "error": "Bot needs admin rights with 'Invite Users' permission in this chat."
             }
-        )
+        
+        # If we get here, bot has required permissions
+        chat_type = "channel" if chat.type == enums.ChatType.CHANNEL else "group"
+        
+        return {
+            "valid": True,
+            "chat_type": chat_type,
+            "title": chat.title,
+            "chat": chat  # Return the chat object for creating invite link
+        }
     except Exception as e:
-        logger.error(f"Error updating assistant status: {e}")
+        return {
+            "valid": False,
+            "error": f"Error validating chat: {str(e)}"
+        }
+
 
 async def is_chat_admin(client, chat_id, user_id):
+    """Check if user is admin in chat"""
     try:
         member = await client.get_chat_member(chat_id, user_id)
         is_admin = member.status in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]
-        print(f"Checked admin status for user {user_id} in chat {chat_id}: {is_admin}")
+        logger.info(f"Admin status check - User: {user_id}, Chat: {chat_id}, Is Admin: {is_admin}")
         return is_admin
-    except Exception as e:
-        print(f"Error checking admin status for user {user_id} in chat {chat_id}: {e}")
+    except UserNotParticipant:
+        logger.warning(f"User {user_id} is not a member of chat {chat_id}")
         return False
-
-async def delete_messages_with_delay(command_msg, response_msg):
-    """Delete messages after a delay with proper error handling"""
-    try:
-        await asyncio.sleep(DELETE_DELAY)
-        
-        if command_msg:
-            try:
-                await command_msg.delete()
-            except Exception as e:
-                pass
-            except Exception as e:
-                # Log other unexpected errors
-                if "MESSAGE_DELETE_FORBIDDEN" not in str(e):
-                    logger.error(f"Unexpected error deleting command message: {e}")
-        
-        if response_msg:
-            try:
-                await response_msg.delete()
-            except Exception as e:
-                logger.error(f"Error deleting response message: {e}")
-
+    except ChatAdminRequired:
+        logger.error(f"Bot needs admin rights in chat {chat_id}")
+        return False
     except Exception as e:
-        logger.error(f"Error in delete_messages_with_delay: {e}")
-
-async def approve_requests_with_delay(chat_id):
-    """Approve join requests with a delay between each approval"""
-    try:
-        pending_requests = []
-        approved_count = 0
-        skipped_count = 0
-        
-        try:
-            # First verify if the user account can access the chat
-            chat = await user.get_chat(chat_id)
-            chat_title = chat.title
-            
-            async for request in user.get_chat_join_requests(chat_id):
-                pending_requests.append(request)
-                
-        except ChannelInvalid:
-            raise ChannelInvalid("CHANNEL_INVALID")
-        except ChatAdminRequired:
-            raise ChatAdminRequired("CHAT_ADMIN_REQUIRED")
-        except Exception as e:
-            error_str = str(e)
-            if "CHANNEL_PRIVATE" in error_str:
-                raise
-            logger.error(f"Error getting join requests: {e}")
-            raise
-        
-        total_requests = len(pending_requests)
-        if total_requests == 0:
-            return 0, 0
-            
-        for request in pending_requests:
-            try:
-                await user.approve_chat_join_request(
-                    chat_id=chat_id,
-                    user_id=request.user.id
-                )
-                
-                # Log the manually approved user
-                await log_approved_user(
-                    user_id=request.user.id,
-                    user_name=request.user.username or request.user.first_name,
-                    chat_id=chat_id,
-                    chat_title=chat_title,
-                    approved_by="manual_approval"
-                )
-                
-                approved_count += 1
-                if approved_count < total_requests:  # Don't delay after the last request
-                    await asyncio.sleep(APPROVE_DELAY)
-            except Exception as e:
-                error_str = str(e)
-                if "USER_CHANNELS_TOO_MUCH" in error_str:
-                    skipped_count += 1
-                    continue
-                elif "CHANNEL_PRIVATE" in error_str:
-                    raise
-                else:
-                    logger.error(f"Error approving request: {e}")
-                    raise
-                
-        return approved_count, skipped_count
-    except Exception as e:
-        error_str = str(e)
-        if not any(err in error_str for err in ["CHANNEL_PRIVATE", "CHANNEL_INVALID", "CHAT_ADMIN_REQUIRED"]):
-            logger.error(f"Error in approve_requests_with_delay: {e}")
-        raise
+        logger.error(f"Error checking admin status - User: {user_id}, Chat: {chat_id}, Error: {str(e)}")
+        return False
     
-async def add_assistant_to_chat(chat_id):
+async def extract_chat_id(message):
     try:
-        # Get the assistant account's info
-        assistant_info = await user.get_me()
-        
-        try:
-            # Try to get chat info using bot first
-            try:
-                chat = await bot.get_chat(chat_id)
-            except ChannelInvalid:
-                chat = await user.get_chat(chat_id)
-            
-            # For channels/groups, try to join using invite link
-            if hasattr(chat, 'invite_link') and chat.invite_link:
-                await user.join_chat(chat.invite_link)
-            else:
-                # Try to create and use a new invite link
-                try:
-                    invite_link = await bot.create_chat_invite_link(chat_id)
-                    await user.join_chat(invite_link.invite_link)
-                except Exception:
-                    # If creating invite link fails, try joining directly
-                    await user.join_chat(chat_id)
-            
-            # Store assistant data after successful join
-            await store_assistant_data(chat_id, chat.title)
-            return True, assistant_info.id, "Successfully added assistant account"
-            
-        except UserAlreadyParticipant:
-            # Update assistant data even if already participant
-            await store_assistant_data(chat_id, chat.title)
-            return True, assistant_info.id, "Assistant is already in the chat"
-            
-        except ChatAdminRequired:
-            return False, assistant_info.id, "Bot needs admin rights to add assistant"
-            
-        except Exception as e:
-            return False, assistant_info.id, f"Error adding assistant: {str(e)}"
-            
+        parts = message.text.split()
+        if len(parts) != 2:
+            return None
+        chat_id = int(parts[1].strip('@'))
+        logger.info(f"Extracted chat ID: {chat_id} from message: {message.text}")
+        return chat_id
+    except ValueError as e:
+        logger.error(f"Invalid chat ID format in message: {message.text}, Error: {str(e)}")
+        return None
     except Exception as e:
-        return False, None, f"Error getting assistant info: {str(e)}"
-
-async def get_user_stats():
-    """Get statistics about bot users"""
-    try:
-        total_users = await user_collection.count_documents({})
-        active_today = await user_collection.count_documents({
-            "last_active": {
-                "$gte": datetime.now(UTC) - timedelta(days=1)
-            }
-        })
-        return {
-            "total_users": total_users,
-            "active_today": active_today
-        }
-    except Exception as e:
-        logger.error(f"Error getting user stats: {e}")
+        logger.error(f"Error extracting chat ID from message: {message.text}, Error: {str(e)}")
         return None
 
-async def get_assistant_stats():
-    """Get statistics about assistant usage"""
+@bot.on_message(filters.command('addassistant') & filters.private)
+@handle_flood_wait
+async def add_assistant(client: Client, message: Message):
+    """Add assistant to a chat using invite link"""
     try:
-        total_chats = await assistant_data_collection.count_documents({})
-        active_chats = await assistant_data_collection.count_documents({
-            "is_active": True
-        })
-        return {
-            "total_chats": total_chats,
-            "active_chats": active_chats
-        }
-    except Exception as e:
-        logger.error(f"Error getting assistant stats: {e}")
-        return None
-    
-@bot.on_message(filters.command("start"))
-async def start_command(client, message):
-    # Store user data when they start the bot
-    await store_user_data(message.from_user)
-    
-    # Get bot username for dynamic button URLs
-    bot_username = (await client.get_me()).username
-    
-    # Rest of your existing start command code...
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add me to your channel", url=f"https://t.me/{bot_username}?startchannel=true")],
-        [InlineKeyboardButton("➕ Add me to your Group", url=f"https://t.me/{bot_username}?startgroup=true")],
-        [
-            InlineKeyboardButton("👥 Support", url="https://t.me/SmokieOfficial"),
-            InlineKeyboardButton("👨‍💻 Owner", url="https://t.me/Hmm_Smokie")
-        ]
-    ])
-    
-    description = (
-        "👋 ɪ'ᴍ ʜᴇʀᴇ ᴛᴏ ʜᴇʟᴘ ʏᴏᴜ ᴍᴀɴᴀɢᴇ ʏᴏᴜʀ ᴄʜᴀɴɴᴇʟ ᴀɴᴅ ɢʀᴏᴜᴘ ᴍᴇᴍʙᴇʀꜱ ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ.\n\n"
-        "Here are some commands you can use:\n\n"
-        "1️⃣ `/addassistant` - Adds an assistant account to your chat to help with join requests.\n"
-        "2️⃣ `/approve` - Approves all pending join requests in the group or channel.\n"
-        "3️⃣ `/auth` - Authorizes the chat for automatic approval of all join requests.\n"
-        "4️⃣ `/unauth` - Removes the authorization for automatic approval of join requests.\n\n"
-        "⚙️ Please ensure that the assistant account is granted admin rights to approve join requests.\n\n"
-        "💬 If you need help, feel free to contact the bot admin!"
-    )
-    
-    await message.reply_video(
-        video="https://cdn.glitch.global/04a38d5f-8c30-452e-b709-33da5c74b12d/175446-853577055.mp4?v=1732257487908",
-        caption=description,
-        reply_markup=keyboard
-    )
-
-@bot.on_message(filters.command('addassistant'))
-async def add_assistant_command(client, message):
-    try:
-        # For channels, skip admin check
-        if message.chat.type != enums.ChatType.CHANNEL:
-            if not await is_chat_admin(client, message.chat.id, message.from_user.id):
-                try:
-                    response_msg = await message.reply("You need to be an admin to use this command.")
-                    asyncio.create_task(delete_messages_with_delay(message, response_msg))
-                except ChatAdminRequired:
-                    logger.warning(f"Bot lacks permission to send messages in chat {message.chat.id}")
-                return
-
-        try:
-            status_message = await message.reply("Adding assistant account to the chat...")
-        except ChatAdminRequired:
-            logger.warning("Bot lacks admin rights to send messages")
+        chat_id = await extract_chat_id(message)
+        if not chat_id:
+            await message.reply("Please use the format: /addassistant [channel_id or group_id]")
             return
+
+        is_admin = await is_chat_admin(client, chat_id, message.from_user.id)
+        if not is_admin:
+            await message.reply("You don't have admin permissions in this chat.")
+            return
+
+        processing_message = await message.reply("Validating chat and adding assistant, please wait...")
         
-        # Try to add the assistant
-        success, assistant_id, msg = await add_assistant_to_chat(message.chat.id)
-        
+        # Validate chat and bot permissions
+        validation_result = await validate_chat(client, chat_id)
+        if not validation_result["valid"]:
+            await processing_message.edit_text(f"❌ Error: {validation_result['error']}")
+            return
+
         try:
-            if success:
-                if "already in the chat" in msg:
-                    final_message = await status_message.edit(
+            # Get the user client's own info
+            assistant_info = await user.get_me()
+            
+            # Create a temporary invite link with expiration
+            chat = validation_result["chat"]
+            invite_link = await client.create_chat_invite_link(
+                chat_id,
+                member_limit=1,
+                expire_date=datetime.now() + timedelta(minutes=5)
+            )
+            
+            # Try to join using the invite link
+            try:
+                await user.join_chat(invite_link.invite_link)
+                
+                # Store assistant data and send success log only if join was successful
+                await store_assistant_data(
+                    chat_id=chat_id,
+                    chat_title=validation_result["title"],
+                    added_by=message.from_user,
+                    assistant_info=assistant_info,
+                    is_active=True
+                )
+                
+                chat_type = validation_result["chat_type"]
+                chat_title = validation_result["title"]
+                
+                # Log successful addition
+                await send_log(
+                    client,
+                    message,
+                    action_type="addassistant",
+                    extra_info={
+                        "status": "success",
+                        "chat_id": chat_id,
+                        "chat_title": chat_title,
+                        "chat_type": chat_type,
+                        "assistant_username": assistant_info.username
+                    }
+                )
+                
+                success_message = (
+                    f"✅ Successfully added assistant to the {chat_type}!\n\n"
+                    f"📌 Chat Details:\n"
+                    f"• Title: {chat_title}\n"
+                    f"• Type: {chat_type}\n"
+                    f"• ID: `{chat_id}`\n\n"
+                    f"🤖 Assistant Details:\n"
+                    f"• Username: @{assistant_info.username}\n"
+                    f"• ID: `{assistant_info.id}`\n\n"
+                    "ℹ️ Please ensure the assistant account has admin rights with 'Invite Users' permission."
+                )
+                
+                await processing_message.edit_text(success_message)
+                
+            except RPCError as e:
+                error_message = str(e).lower()
+                
+                if "user_already_participant" in error_message:
+                    # Store assistant data even if already a participant
+                    await store_assistant_data(
+                        chat_id=chat_id,
+                        chat_title=validation_result["title"],
+                        added_by=message.from_user,
+                        assistant_info=assistant_info,
+                        is_active=True
+                    )
+                    
+                    # Log the already participant status only once
+                    await send_log(
+                        client, 
+                        message, 
+                        action_type="addassistant",
+                        extra_info={
+                            "status": "already_participant",
+                            "chat_id": chat_id,
+                            "chat_title": validation_result["title"],
+                            "assistant_username": assistant_info.username
+                        }
+                    )
+                    
+                    await processing_message.edit_text(
                         "Assistant account is already in the chat.\n"
                         "⚠️ Please ensure the assistant has admin rights to approve join requests."
                     )
+                    return
+                elif "invite_hash_expired" in error_message:
+                    await processing_message.edit_text(
+                        "❌ Error: Unable to add assistant - The assistant account appears to be banned from this chat.\n\n"
+                        "Please follow these steps:\n"
+                        f"1. Check if the assistant account @{assistant_info.username} is banned\n"
+                        "2. If banned, unban the account from your chat settings\n"
+                        "3. Try the /addassistant command again\n\n"
+                        "If the problem persists, you may need to:\n"
+                        "• Remove any restrictions on the assistant account\n"
+                        "• Wait a few hours before trying again\n"
+                        "• Contact Telegram support if the issue continues"
+                    )
+                    return
+                elif "privacy_restricted" in error_message:
+                    await processing_message.edit_text(
+                        "❌ Error: Unable to add assistant due to privacy restrictions.\n"
+                        "Please ensure the chat's privacy settings allow new members to join."
+                    )
+                    return
+                elif "user_banned_in_channel" in error_message:
+                    await processing_message.edit_text(
+                        "❌ Error: The assistant account is banned from this chat.\n"
+                        "Please unban the account and try again."
+                    )
+                    return
                 else:
-                    final_message = await status_message.edit(
-                        "✅ Assistant account has been successfully added to the chat.\n"
-                        "⚠️ Important: Please grant admin rights to the assistant account "
-                        "with at least these permissions:\n"
-                        "- Invite users\n"
-                        "- Manage users\n\n"
-                        "Once admin rights are granted, you can use /approve to handle join requests."
-                    )
-            else:
-                # Simplified error message
-                error_text = (
-                    "❌ Unable to add assistant\n\n"
-                    "Please make sure:\n"
-                    "1️⃣ The bot is an admin in this chat\n"
-                    "2️⃣ The bot has permission to invite members\n"
-                    "3️⃣ Try removing and re-adding the bot as admin"
-                )
-                
-                final_message = await status_message.edit(error_text)
-            
-            # Create task for auto-deletion
-            asyncio.create_task(delete_messages_with_delay(message, final_message))
-            
-        except ChatAdminRequired:
-            logger.warning("Bot lacks admin rights to edit messages")
-        except Exception as e:
-            logger.error(f"Error in message handling: {str(e)}")
-            
-    except Exception as e:
-        logger.error(f"Error in add_assistant_command: {str(e)}")
-
-@bot.on_message(filters.command('approve'))
-async def approve_requests(client, message):
-    chat_id = message.chat.id
-    chat_type = message.chat.type
-    chat_name = message.chat.title
-    processing_message = None
-    
-    try:
-        processing_message = await message.reply("⏳ Checking request...")
-        
-        # Handle different chat types
-        if chat_type == enums.ChatType.CHANNEL:
-            # For channels, just verify bot permissions
-            try:
-                bot_member = await client.get_chat_member(chat_id, (await client.get_me()).id)
-                if bot_member.status != enums.ChatMemberStatus.ADMINISTRATOR:
-                    await processing_message.edit_text(
-                        "❌ Bot needs admin rights to manage join requests!\n"
-                        "Please grant admin permissions and try again."
-                    )
-                    asyncio.create_task(delete_messages_with_delay(message, processing_message))
-                    return
-            except ChatAdminRequired:
-                await processing_message.edit_text("❌ Bot needs admin rights!")
-                asyncio.create_task(delete_messages_with_delay(message, processing_message))
-                return
-                
-        elif chat_type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
-            # For groups and supergroups, verify both user and bot permissions
-            if not await is_chat_admin(client, chat_id, message.from_user.id):
-                await processing_message.edit_text("❌ You need admin rights to use this command.")
-                asyncio.create_task(delete_messages_with_delay(message, processing_message))
-                return
-                
-            try:
-                bot_member = await client.get_chat_member(chat_id, (await client.get_me()).id)
-                if bot_member.status != enums.ChatMemberStatus.ADMINISTRATOR:
-                    await processing_message.edit_text(
-                        "❌ Bot needs admin rights to manage join requests!\n"
-                        "Please grant admin permissions and try again."
-                    )
-                    asyncio.create_task(delete_messages_with_delay(message, processing_message))
-                    return
-            except ChatAdminRequired:
-                await processing_message.edit_text("❌ Bot needs admin rights!")
-                asyncio.create_task(delete_messages_with_delay(message, processing_message))
-                return
-
-        # Verify assistant account has access to the chat
-        try:
-            chat = await user.get_chat(chat_id)
-            if not chat:
-                raise ChannelInvalid("Chat not found")
-                
-            # Verify assistant account's admin rights
-            assistant = await user.get_chat_member(chat_id, (await user.get_me()).id)
-            if assistant.status != enums.ChatMemberStatus.ADMINISTRATOR:
-                await processing_message.edit_text(
-                    "⚠️ Assistant Account needs admin rights!\n\n"
-                    "Please ensure the Assistant Account has these permissions:\n"
-                    "1️⃣ Add New Members\n"
-                    "2️⃣ Manage Chat\n"
-                    "3️⃣ Invite Users via Link"
-                )
-                asyncio.create_task(delete_messages_with_delay(message, processing_message))
-                return
-                
-        except Exception as e:
-            error_message = get_error_message(str(e), chat_name)
-            await processing_message.edit_text(f"❌ Error: {error_message}")
-            asyncio.create_task(delete_messages_with_delay(message, processing_message))
-            return
-
-        # Check if there's already an active approval process
-        is_active = await is_approval_in_progress()
-        
-        # Add request to queue
-        await add_to_queue(
-            chat_id=chat_id,
-            chat_title=chat_name,
-            requested_by=message.from_user.id if message.from_user else None
-        )
-        
-        # Get queue position
-        queue_position = await get_queue_position(chat_id)
-        
-        # Key change: Check if there's an active process OR if not first in queue
-        if is_active or queue_position > 1:
-            # Delete the initial checking message
-            if processing_message:
-                try:
-                    await processing_message.delete()
-                except:
-                    pass
+                    raise
                     
-            # Send queue position message
-            queue_msg = await message.reply(
-                f"⏳ Your request is in queue\n"
-                f"📊 Position: {queue_position}\n"
-                "Please wait until current process is complete."
+        except FloodWait as e:
+            error_msg = f"Rate limited. Please try again after {e.value} seconds."
+            await processing_message.edit_text(error_msg)
+            logger.warning(f"FloodWait in add_assistant: {e.value} seconds")
+            
+            # Log flood wait error
+            await send_log(
+                client,
+                message,
+                action_type="addassistant",
+                extra_info={
+                    "status": "flood_wait",
+                    "chat_id": chat_id,
+                    "wait_time": e.value
+                }
             )
-            # Save the queue message ID for later reference
-            await save_queue_message(chat_id, queue_msg.id)
-        else:
-            # Only first in queue and no active process
-            if processing_message:
-                await processing_message.edit_text("🔄 Processing will begin shortly...")
-                asyncio.create_task(delete_messages_with_delay(message, processing_message))
-
+            
+        except RPCError as e:
+            error_msg = f"Failed to add assistant: {str(e)}"
+            await processing_message.edit_text(error_msg)
+            logger.error(error_msg)
+            
+            # Log RPC error
+            await send_log(
+                client,
+                message,
+                action_type="addassistant",
+                extra_info={
+                    "status": "rpc_error",
+                    "chat_id": chat_id,
+                    "error": str(e)
+                }
+            )
+            
     except Exception as e:
-        logger.error(f"Error in approve command: {e}")
-        error_text = "❌ An unexpected error occurred."
-        try:
-            error_msg = await message.reply(error_text)
-            asyncio.create_task(delete_messages_with_delay(message, error_msg))
-        except:
-            pass
+        logger.error(f"Error in add_assistant: {str(e)}")
+        logger.error(traceback.format_exc())
+        await message.reply("An unexpected error occurred. Please try again later.")
+        
+        # Log unexpected error
+        await send_log(
+            client,
+            message,
+            action_type="addassistant",
+            extra_info={
+                "status": "error",
+                "error": str(e)
+            }
+        )
 
-# Modified get_error_message function
-def get_error_message(error_str: str, chat_name: str) -> str:
-    """Get user-friendly error message based on error string"""
-    if "CHANNEL_INVALID" in error_str:
-        return (
-            f"⚠️ Assistant Account is not in {chat_name}!\n\n"
-            f"Please add the Assistant account in {chat_name} "
-            "with admin privileges using /addassistant command."
-        )
-    elif "CHANNEL_PRIVATE" in error_str:
-        return (
-            f"⚠️ {chat_name} is private!\n\n"
-            "Please ensure:\n"
-            f"1️⃣ Assistant Account is a member of {chat_name}\n"
-            "2️⃣ Assistant Account has admin privileges\n"
-            "3️⃣ The group/channel is accessible to the Assistant"
-        )
-    elif "CHAT_ADMIN_REQUIRED" in error_str:
-        return (
-            "⚠️ Admin Privileges Required!\n\n"
-            f"Please ensure Assistant Account has these permissions in {chat_name}:\n"
-            "1️⃣ Add New Members\n"
-            "2️⃣ Manage Chat\n"
-            "3️⃣ Invite Users via Link\n\n"
-            "Contact the group owner to grant these permissions."
-        )
-    elif "USER_CHANNELS_TOO_MUCH" in error_str:
-        return (
-            "⚠️ Some users couldn't be approved because they've joined "
-            "too many channels/groups. These requests were skipped."
-        )
-    else:
-        return f"An unexpected error occurred: {str(error_str)}"
-
-@bot.on_message(filters.command("auth") & (filters.group | filters.channel))
-async def authorize_chat_command(client, message):
+@bot.on_message(filters.command('approve') & filters.private)
+@handle_flood_wait
+async def approve_requests(client, message):
     try:
-        # For non-channel chats, check admin privileges
-        if message.chat.type != enums.ChatType.CHANNEL:
-            if not await is_chat_admin(client, message.chat.id, message.from_user.id):
-                response_msg = await message.reply("You don't have this permission")
-                asyncio.create_task(delete_messages_with_delay(message, response_msg))
-                return
-
-        try:
-            bot_member = await bot.get_chat_member(message.chat.id, (await bot.get_me()).id)
-            if bot_member.status != enums.ChatMemberStatus.ADMINISTRATOR:
-                response_msg = await message.reply("Bot needs to be an admin in this chat to approve join requests!")
-                asyncio.create_task(delete_messages_with_delay(message, response_msg))
-                return
-        except ChatAdminRequired:
-            response_msg = await message.reply("Bot needs admin rights to function properly!")
-            asyncio.create_task(delete_messages_with_delay(message, response_msg))
+        args = message.text.split()
+        if len(args) not in [2, 3]:
+            await message.reply("Please use either:\n/approve [chat_id]\nOR\n/approve [chat_id] [number_of_requests]")
             return
 
-        # For channels, use channel info instead of user info
-        if message.chat.type == enums.ChatType.CHANNEL:
-            authorized_by = {
-                "user_id": None,
-                "username": None,
-                "full_name": "Channel Authorization",
-                "auth_type": "channel"
-            }
-        else:
-            authorized_by = {
-                "user_id": message.from_user.id,
-                "username": message.from_user.username,
-                "full_name": message.from_user.first_name,
-                "auth_type": "user"
-            }
+        try:
+            chat_id = int(args[1].strip('@'))
+        except ValueError:
+            await message.reply("Invalid chat ID format.")
+            return
 
-        await authorize_chat(
-            chat_id=message.chat.id,
-            chat_title=message.chat.title,
-            authorized_by=authorized_by
+        num_requests = None
+        if len(args) == 3:
+            try:
+                num_requests = int(args[2])
+                if num_requests <= 0:
+                    await message.reply("Number of requests must be greater than 0.")
+                    return
+            except ValueError:
+                await message.reply("Invalid number format for requests.")
+                return
+
+        if not await is_chat_admin(client, chat_id, message.from_user.id):
+            await message.reply("You don't have admin permissions in this chat.")
+            return
+
+        # Log the initial approval request
+        await send_log(client, message, action_type="approve")
+
+        # Check assistant status before queuing
+        try:
+            assistant_info = await user.get_me()
+            assistant_member = await user.get_chat_member(chat_id, assistant_info.id)
+            
+            if not assistant_member.privileges or not assistant_member.privileges.can_invite_users:
+                await message.reply(
+                    "⚠️ Assistant requires admin rights with 'Invite Users' permission.\n"
+                    "Please add the assistant as admin first using /addassistant command."
+                )
+                return
+
+        except UserNotParticipant:
+            await message.reply(
+                "⚠️ Assistant is not a member of this chat.\n"
+                "Please add the assistant first using /addassistant command."
+            )
+            return
+            
+        except Exception as e:
+            logger.error(f"Error checking assistant status: {str(e)}")
+            await message.reply("An error occurred while checking assistant status. Please try again.")
+            return
+
+        # Add request to queue
+        queue_position, request_id = await queue_manager.add_to_queue(
+            chat_id=chat_id,
+            admin_id=message.from_user.id,
+            num_requests=num_requests
+        )
+
+        await message.reply(
+            f"✅ Your approval request has been queued!\n\n"
+            f"🔹 Queue Position: {queue_position}\n"
+            f"🔹 Request ID: `{str(request_id)}`\n\n"
+            "You will be notified when the processing is complete."
+        )
+
+    except Exception as e:
+        logger.error(f"Error in approve_requests: {str(e)}")
+        await message.reply("An unexpected error occurred. Please try again later.")
+
+async def approve_requests_internal(chat_id: int, admin_id: int, num_requests: int = None):
+    try:
+        # First verify the chat exists and is accessible to the bot
+        try:
+            chat = await bot.get_chat(chat_id)
+        except ChannelPrivate:
+            raise Exception(
+                "Unable to access the chat. Ensure the bot is added to the channel/group "
+                "and has proper permissions."
+            )
+        except Exception as e:
+            raise Exception(f"Unable to find the chat. Please verify the chat ID. Error: {str(e)}")
+
+        # Check if assistant is in the chat
+        try:
+            assistant_info = await user.get_me()
+            assistant_member = await user.get_chat_member(chat_id, assistant_info.id)
+        except UserNotParticipant:
+            raise Exception(
+                "Assistant account is not a member of the chat. "
+                "Please first add the assistant using /addassistant command."
+            )
+        except Exception as e:
+            logger.error(f"Error checking assistant membership: {str(e)}")
+            raise
+
+        # Check assistant's admin rights
+        if not assistant_member.privileges or not assistant_member.privileges.can_invite_users:
+            raise Exception(
+                "Assistant account needs admin rights with 'Invite Users' permission. "
+                "Please ensure proper admin rights are granted."
+            )
+
+        # Initialize counters
+        stats = {
+            "approved_count": 0,
+            "skipped_count": 0,
+            "already_member_count": 0,
+            "too_many_channels_count": 0,
+            "deactivated_count": 0  # New counter for deactivated users
+        }
+        
+        try:
+            async for request in user.get_chat_join_requests(chat_id):
+                if num_requests is not None and stats["approved_count"] >= num_requests:
+                    break
+                
+                try:
+                    # Try to approve the request
+                    await user.approve_chat_join_request(
+                        chat_id=chat_id,
+                        user_id=request.user.id
+                    )
+                    
+                    # Store approved user data
+                    await store_approved_user(
+                        user=request.user,
+                        chat=chat,
+                        approval_type="manual_approval"
+                    )
+                    
+                    stats["approved_count"] += 1
+                    await asyncio.sleep(0.5)  # Rate limiting prevention
+                    
+                except RPCError as e:
+                    error_message = str(e).upper()
+                    if "USER_ALREADY_PARTICIPANT" in error_message:
+                        stats["already_member_count"] += 1
+                        logger.info(f"User {request.user.id} is already a member of chat {chat_id}")
+                        try:
+                            # Try to hide the join request since user is already a member
+                            await user.decline_chat_join_request(chat_id, request.user.id)
+                        except Exception as hide_error:
+                            logger.error(f"Error hiding join request: {str(hide_error)}")
+                    elif "USER_CHANNELS_TOO_MUCH" in error_message or "CHANNELS_TOO_MUCH" in error_message:
+                        stats["too_many_channels_count"] += 1
+                        logger.info(f"User {request.user.id} is in too many channels/groups")
+                    elif "INPUT_USER_DEACTIVATED" in error_message:
+                        stats["deactivated_count"] += 1
+                        logger.info(f"Skipping deactivated user {request.user.id}")
+                        try:
+                            # Try to hide the join request for deactivated user
+                            await user.decline_chat_join_request(chat_id, request.user.id)
+                        except Exception as hide_error:
+                            logger.error(f"Error hiding join request for deactivated user: {str(hide_error)}")
+                    else:
+                        stats["skipped_count"] += 1
+                        logger.error(f"Error approving request: {str(e)}")
+                    continue
+
+        except ChatAdminRequired:
+            raise Exception(
+                "Assistant account needs admin rights to view join requests. "
+                "Please ensure proper admin rights are granted."
+            )
+
+        # Notify admin of completion
+        try:
+            # Prepare detailed status message
+            status_message = []
+            if stats["approved_count"] > 0:
+                status_message.append(f"✅ Successfully approved {stats['approved_count']} request(s)")
+            if stats["already_member_count"] > 0:
+                status_message.append(f"ℹ️ Skipped {stats['already_member_count']} already member(s)")
+            if stats["too_many_channels_count"] > 0:
+                status_message.append(
+                    f"⚠️ Skipped {stats['too_many_channels_count']} user(s) in too many channels"
+                )
+            if stats["deactivated_count"] > 0:
+                status_message.append(f"❗️ Skipped {stats['deactivated_count']} deactivated user(s)")
+            if stats["skipped_count"] > 0:
+                status_message.append(f"❌ Failed to approve {stats['skipped_count']} request(s)")
+            
+            if status_message:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text="\n".join(status_message)
+                )
+            else:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text="ℹ️ No pending join requests found."
+                )
+        except Exception as e:
+            logger.error(f"Error sending completion notification to admin: {str(e)}")
+
+        return stats
+
+    except Exception as e:
+        logger.error(f"Error in approve_requests_internal: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
+@bot.on_message(filters.command("auth") & filters.private)
+@handle_flood_wait
+async def authorize_chat(client, message):
+    try:
+        chat_id = await extract_chat_id(message)
+        if not chat_id:
+            await message.reply("Please use the format: /auth [channel_id or group_id]")
+            return
+
+        if not await is_chat_admin(client, chat_id, message.from_user.id):
+            await message.reply("You don't have admin permissions in this chat.")
+            return
+
+        # Get chat info
+        chat = await client.get_chat(chat_id)
+        
+        # Store authorization in MongoDB
+        authorized_by = {
+            "user_id": message.from_user.id,
+            "username": message.from_user.username,
+            "first_name": message.from_user.first_name
+        }
+        
+        await store_chat_authorization(
+            chat_id=chat_id,
+            chat_title=chat.title,
+            authorized_by=authorized_by,
+            is_authorized=True
         )
         
-        response_msg = await message.reply("This chat has been authorized for automatic approval of all join requests.")
-        asyncio.create_task(delete_messages_with_delay(message, response_msg))
+        await message.reply(f"Chat {chat_id} has been authorized for automatic approval.")
+        logger.info(f"Chat {chat_id} authorized for automatic approval by user {message.from_user.id}")
+        await send_log(client, message, action_type="auth")
         
     except Exception as e:
         logger.error(f"Error in authorize_chat: {str(e)}")
-        error_msg = await message.reply("An error occurred while processing your request.")
-        asyncio.create_task(delete_messages_with_delay(message, error_msg))
+        logger.error(traceback.format_exc())
+        await message.reply("An error occurred while authorizing the chat. Please try again later.")
 
-@bot.on_message(filters.command("unauth") & (filters.group | filters.channel))
-async def unauthorize_chat_command(client, message):
+@bot.on_message(filters.command("unauth") & filters.private)
+@handle_flood_wait
+async def unauthorize_chat(client, message):
     try:
-        if message.chat.type != enums.ChatType.CHANNEL and not await is_chat_admin(client, message.chat.id, message.from_user.id):
-            try:
-                response_msg = await message.reply("You don't have this permission")
-                asyncio.create_task(delete_messages_with_delay(message, response_msg))
-            except ChatAdminRequired:
-                logger.warning(f"Bot lacks permission to send messages in chat {message.chat.id}")
+        chat_id = await extract_chat_id(message)
+        if not chat_id:
+            await message.reply("Please use the format: /unauth [channel_id or group_id]")
             return
 
-        chat_id = message.chat.id
-        if await is_chat_authorized(chat_id):
-            await unauthorize_chat(chat_id)
-            try:
-                response_msg = await message.reply("This chat has been unauthorized for automatic approval of join requests.")
-            except ChatAdminRequired:
-                logger.info(f"Chat {chat_id} unauthorized successfully but bot couldn't send confirmation message")
-        else:
-            try:
-                response_msg = await message.reply("This chat is not authorized for automatic approval.")
-            except ChatAdminRequired:
-                logger.info(f"Bot couldn't send 'not authorized' message in chat {chat_id}")
-            
-        if 'response_msg' in locals():
-            asyncio.create_task(delete_messages_with_delay(message, response_msg))
-            
+        if not await is_chat_admin(client, chat_id, message.from_user.id):
+            await message.reply("You don't have admin permissions in this chat.")
+            return
+
+        # Check if chat is currently authorized
+        if not await is_chat_authorized(chat_id):
+            await message.reply("This chat is not authorized for automatic approval.")
+            return
+
+        # Get chat info
+        chat = await client.get_chat(chat_id)
+        
+        # Store unauthorized status in MongoDB
+        authorized_by = {
+            "user_id": message.from_user.id,
+            "username": message.from_user.username,
+            "first_name": message.from_user.first_name
+        }
+        
+        await store_chat_authorization(
+            chat_id=chat_id,
+            chat_title=chat.title,
+            authorized_by=authorized_by,
+            is_authorized=False
+        )
+        
+        await message.reply(f"Chat {chat_id} has been unauthorized for automatic approval.")
+        logger.info(f"Chat {chat_id} unauthorized by user {message.from_user.id}")
+        await send_log(client, message, action_type="unauth")
+        
     except Exception as e:
         logger.error(f"Error in unauthorize_chat: {str(e)}")
-        try:
-            error_msg = await message.reply("An error occurred while processing your request.")
-            asyncio.create_task(delete_messages_with_delay(message, error_msg))
-        except ChatAdminRequired:
-            logger.warning(f"Bot lacks permission to send error message in chat {message.chat.id}")
-
-@bot.on_message(filters.command("addstring"))
-async def add_session_string(client, message):
-    try:
-        # Check if user is bot owner (add your user ID here)
-        if message.from_user.id != 1949883614:  # Replace with your user ID
-            await message.reply("❌ Only bot owner can use this command.")
-            return
-
-        # Get the session string from command
-        if len(message.command) != 2:
-            await message.reply("❌ Usage: /addstring <session_string>")
-            return
-
-        new_session_string = message.command[1]
-
-        # Save to database
-        await db.settings.update_one(
-            {"setting": "session_string"},
-            {"$set": {
-                "value": new_session_string,
-                "updated_at": datetime.now(UTC),
-                "updated_by": message.from_user.id
-            }},
-            upsert=True
-        )
-
-        # Recreate user client with new session
-        global user
-        user = Client(
-            "user_session",
-            session_string=new_session_string
-        )
-        await user.start()
-
-        # Delete the command message for security
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-        # Send success message
-        success_msg = await message.reply("✅ Session string updated successfully!")
-        await asyncio.sleep(5)
-        await success_msg.delete()
-
-    except Exception as e:
-        error_msg = await message.reply(f"❌ Error updating session string: {str(e)}")
-        await asyncio.sleep(5)
-        await error_msg.delete()
-
+        logger.error(traceback.format_exc())
+        await message.reply("An error occurred while unauthorizing the chat. Please try again later.")
 
 @bot.on_chat_join_request()
-async def handle_join_request(_, request):
-    chat_id = request.chat.id
-    user_id = request.from_user.id
-
-    if await is_chat_authorized(chat_id):
-        user_full_name = request.from_user.full_name
-        chat_name = request.chat.title
-
-        # Welcome message
-        welcome_message = f"𝐇𝐞𝐲 {user_full_name} ✨\n\n" \
-                          f"𝗪𝗲𝗹𝗰𝗼𝗺𝗲 𝘁𝗼 𝗼𝘂𝗿 𝗰𝗼𝗺𝗺𝘂𝗻𝗶𝘁𝘆 🎉\n\n" \
-                          f"●︎ ʏᴏᴜ ʜᴀᴠᴇ ʙᴇᴇɴ ᴀᴘᴘʀᴏᴠᴇᴅ ᴛᴏ **{chat_name}**!\n\n" \
-                          "ᴘʟᴇᴀꜱᴇ ᴄᴏɴꜱɪᴅᴇʀ ᴊᴏɪɴɪɴɢ ᴏᴜʀ ꜱᴜᴘᴘᴏʀᴛ ᴄʜᴀɴɴᴇʟ ᴀꜱ ᴡᴇʟʟ."
-        
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Join Support Channel", url="https://t.me/SmokieOfficial")]
-        ])        
-
-        gif_url = "https://cdn.glitch.global/04a38d5f-8c30-452e-b709-33da5c74b12d/175446-853577055.mp4?v=1732257487908"
-        await bot.send_animation(chat_id=user_id, animation=gif_url, caption=welcome_message, reply_markup=keyboard)
-        await request.approve()
-
-        # Log the approved user
-        await log_approved_user(
-            user_id=user_id,
-            user_name=request.from_user.username or user_full_name,
-            chat_id=chat_id,
-            chat_title=chat_name,
-            approved_by="auto_approval"
-        )
-
-@bot.on_message(filters.command("broadcast") & filters.private)
-async def broadcast_handler(client, message: Message):
-    """Handle the broadcast command"""
-    if str(message.from_user.id) != "1949883614":  # Your user ID
-        await message.reply_text("⛔️ This command is only for the bot owner.")
-        return
-
-    if not message.reply_to_message:
-        await message.reply_text(
-            "❗️ Please reply to a message to broadcast it to all users."
-        )
-        return
-
-    # Initial broadcast status message
-    status_msg = await message.reply_text("🔍 Gathering user data...")
-
-    # Get unique users from both collections
-    unique_users = set()
-    
-    # Get users from user_collection
-    async for user in user_collection.find({}, {'user_id': 1}):
-        if 'user_id' in user:
-            unique_users.add(user['user_id'])
-    
-    # Get users from approved_users collection
-    async for user in db.approved_users.find({}, {'user_id': 1}):
-        if 'user_id' in user:
-            unique_users.add(user['user_id'])
-
-    total_users = len(unique_users)
-    await status_msg.edit_text(f"🚀 Starting broadcast to {total_users} unique users...")
-
-    done = 0
-    success = 0
-    failed = 0
-    blocked = 0
-    deleted = 0
-    invalid = 0
-    failed_users = []
-    
-    async def broadcast_message(user_id):
-        """Helper function to broadcast a message to a single user"""
-        try:
-            await message.reply_to_message.copy(user_id)
-            return True, None
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            return await broadcast_message(user_id)
-        except UserIsBlocked:
-            return False, "blocked"
-        except InputUserDeactivated:
-            return False, "deactivated"
-        except PeerIdInvalid:
-            return False, "invalid_id"
-        except Exception as e:
-            return False, str(e)
-    
-    for user_id in unique_users:
-        done += 1
-        success_status, error = await broadcast_message(user_id)
-        
-        if success_status:
-            success += 1
-        else:
-            failed += 1
-            failed_users.append((user_id, error))
-            if error == "blocked":
-                blocked += 1
-            elif error == "deactivated":
-                deleted += 1
-            elif error == "invalid_id":
-                invalid += 1
-
-        if done % 20 == 0:
-            try:
-                await status_msg.edit_text(
-                    f"🚀 Broadcast in Progress...\n\n"
-                    f"👥 Total Unique Users: {total_users}\n"
-                    f"✅ Completed: {done} / {total_users}\n"
-                    f"✨ Success: {success}\n"
-                    f"❌ Failed: {failed}\n\n"
-                    f"🚫 Blocked: {blocked}\n"
-                    f"❗️ Deleted: {deleted}\n"
-                    f"📛 Invalid: {invalid}"
-                )
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-            except Exception:
-                pass
-
-    # Final broadcast status
-    completion_time = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    
-    await status_msg.edit_text(
-        f"✅ Broadcast Completed!\n"
-        f"Completed at: {completion_time}\n\n"
-        f"👥 Total Unique Users: {total_users}\n"
-        f"✨ Success: {success}\n"
-        f"❌ Failed: {failed}\n\n"
-        f"Success Rate: {(success/total_users)*100:.2f}%\n\n"
-        f"🚫 Blocked: {blocked}\n"
-        f"❗️ Deleted: {deleted}\n"
-        f"📛 Invalid: {invalid}"
-    )
-
-    # Clean up invalid users from both databases
-    if failed_users:
-        clean_msg = await message.reply_text(
-            "🧹 Cleaning databases...\n"
-            "Removing blocked and deleted users."
-        )
-        
-        # Extract user IDs from failed_users list
-        invalid_user_ids = [user_id for user_id, _ in failed_users]
-        
-        # Delete invalid users from both collections
-        delete_result1 = await user_collection.delete_many(
-            {"user_id": {"$in": invalid_user_ids}}
-        )
-        delete_result2 = await db.approved_users.delete_many(
-            {"user_id": {"$in": invalid_user_ids}}
-        )
-        
-        total_deleted = delete_result1.deleted_count + delete_result2.deleted_count
-        await clean_msg.edit_text(
-            f"🧹 Databases cleaned!\n"
-            f"Removed {total_deleted} invalid user entries."
-        )
-
-@bot.on_message(filters.command("users"))
-async def users_status_command(client, message):
-    """Handle the users command to show bot usage statistics"""
-    # Check if user is authorized (bot owner)
-    if str(message.from_user.id) != "1949883614":
-        await message.reply_text("⛔️ This command is only for the bot owner.")
-        return
-
+@handle_flood_wait
+async def handle_join_request(client, request):
     try:
-        status_msg = await message.reply_text("📊 Gathering statistics...")
+        chat_id = request.chat.id
+        user_id = request.from_user.id
 
-        # Get current time in UTC
-        now = datetime.now(UTC)
+        # Check authorization status in MongoDB
+        if await is_chat_authorized(chat_id):
+            user_full_name = request.from_user.full_name
+            chat_name = request.chat.title
 
-        # Calculate time thresholds
-        one_day_ago = now - timedelta(days=1)
-        one_week_ago = now - timedelta(days=7)
-        one_month_ago = now - timedelta(days=30)
-        one_year_ago = now - timedelta(days=365)
+            welcome_message = f"𝐇𝐞𝐲 {user_full_name} ✨\n\n" \
+                            "𝗪𝗲𝗹𝗰𝗼𝗺𝗲 𝘁𝗼 𝗼𝘂𝗿 𝗰𝗼𝗺𝗺𝘂𝗻𝗶𝘁𝘆 🎉\n\n" \
+                            f"●︎ ʏᴏᴜ ʜᴀᴠᴇ ʙᴇᴇɴ ᴀᴘᴘʀᴏᴠᴇᴅ ᴛᴏ ᴊᴏɪɴ {chat_name}!\n\n" \
+                            "ᴘʟᴇᴀꜱᴇ ᴄᴏɴꜱɪᴅᴇʀ ᴊᴏɪɴɪɴɢ ᴏᴜʀ ꜱᴜᴘᴘᴏʀᴛ ᴄʜᴀɴɴᴇʟ ᴀꜱ ᴡᴇʟʟ."
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Join Support Channel", url="https://t.me/SmokieOfficial")]
+            ])
 
-        # Get activity counts for different periods
-        day_active = await user_collection.count_documents({
-            "last_active": {"$gte": one_day_ago}
-        })
+            try:
+                gif_url = "https://cdn.glitch.global/04a38d5f-8c30-452e-b709-33da5c74b12d/175446-853577055.mp4?v=1732257487908"
+                await bot.send_animation(
+                    chat_id=user_id,
+                    animation=gif_url,
+                    caption=welcome_message,
+                    reply_markup=keyboard
+                )
+                await request.approve()
+                # Store approved user data
+                await store_approved_user(
+                    user=request.from_user,
+                    chat=request.chat,
+                    approval_type="auto_approval"
+                )
+                logger.info(f"Approved join request for user {user_id} in chat {chat_id}")
+            except ChatWriteForbidden:
+                logger.warning(f"Unable to send welcome message to user {user_id} - User has blocked the bot")
+            except Exception as e:
+                logger.error(f"Error sending welcome message to user {user_id}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error in handle_join_request: {str(e)}")
+        logger.error(traceback.format_exc())
+
+@bot.on_message(filters.command('start') & filters.private)
+@handle_flood_wait
+async def start_command(client: Client, message: Message):
+    """Handle the /start command"""
+    try:
+        # Store user data
+        await store_user_data(message.from_user)
         
-        week_active = await user_collection.count_documents({
-            "last_active": {"$gte": one_week_ago}
-        })
         
-        month_active = await user_collection.count_documents({
-            "last_active": {"$gte": one_month_ago}
-        })
-        
-        year_active = await user_collection.count_documents({
-            "last_active": {"$gte": one_year_ago}
-        })
-
-        # Get total users
-        total_users = await user_collection.count_documents({})
-
-        # Get active chats where bot/assistant is present
-        active_chats = await assistant_data_collection.count_documents({
-            "is_active": True
-        })
-
-        # Format the status message
-        status_text = (
-            "📊 Approval Bot Status ⇾ Report ✅\n"
-            "━━━━━━━━━━━━━━━━\n"
-            f"1 Day: {day_active:,} users were active\n"
-            f"1 Week: {week_active:,} users were active\n"
-            f"1 Month: {month_active:,} users were active\n"
-            f"1 Year: {year_active:,} users were active\n"
-            "━━━━━━━━━━━━━━━━\n"
-            f"Total Smart Tools Users: {total_users:,}\n"
-            f"Active in Chats: {active_chats:,}"
+        user_name = message.from_user.first_name
+        start_message = (
+            f"👋 **Hello {user_name}!**\n\n"
+            "🤖 I am **Auto Approve Bot**, your automated assistant for managing join requests in your channels and groups.\n\n"
+            "**Key Features:**\n"
+            "• Auto-approve new join requests\n"
+            "• Manual approval management\n"
+            "• Detailed approval logs\n\n"
+            "**Main Commands:**\n"
+            "• /addassistant [ChatId] - To add assistant to your chat\n"
+            "• /approve [ChatId] - Manually approve pending requests\n"
+            "• /auth [ChatId] - Enable auto-approval for a chat\n"
+            "• /unauth [ChatId] - Disable auto-approval\n\n"
+            "To get started, add me to your channel/group as an admin with 'Invite Users' permission! 🚀"
         )
 
-        await status_msg.edit_text(status_text)
+        # Create inline keyboard with support channel button
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Support Channel", url="https://t.me/SmokieOfficial")]
+        ])
+
+        # Send welcome video with caption
+        await client.send_video(
+            chat_id=message.chat.id,
+            video="https://cdn.glitch.global/94c1411f-81f7-4957-8c81-6e2e5285e45c/201734-916310639_medium.mp4?v=1736459660788",
+            caption=start_message,
+            reply_markup=keyboard
+        )
+        logger.info(f"Start command handled and user data stored for user {message.from_user.id}")
+        await send_log(client, message, action_type="start")
+    except Exception as e:
+        error_msg = f"Error in start command: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        await message.reply("An error occurred while processing your request. Please try again later.")
+
+async def start_queue_processor():
+    """Start the queue processor"""
+    while True:
+        try:
+            await queue_manager.process_queue()
+        except Exception as e:
+            logger.error(f"Queue processor error: {str(e)}")
+            await asyncio.sleep(5)
+
+class BroadcastStats:
+    def __init__(self):
+        self.total_users = 0
+        self.done = 0
+        self.success = 0
+        self.failed = 0
+        self.blocked = 0
+        self.deleted = 0
+        self.invalid = 0
+        self.failed_users: List[Tuple[int, str]] = []
+
+    def update_failed(self, user_id: int, error: str):
+        self.failed += 1
+        self.failed_users.append((user_id, error))
+        if error == "blocked":
+            self.blocked += 1
+        elif error == "deactivated":
+            self.deleted += 1
+        elif error == "invalid_id":
+            self.invalid += 1
+
+async def broadcast_message(client: Client, user_id: int, message: Message) -> Tuple[bool, str]:
+    """Broadcast a message to a user with error handling"""
+    try:
+        if message.text:
+            await client.send_message(
+                chat_id=user_id,
+                text=message.text,
+                entities=message.entities,
+                reply_markup=message.reply_markup,
+                disable_notification=True
+            )
+        elif message.photo:
+            await client.send_photo(
+                chat_id=user_id,
+                photo=message.photo.file_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                reply_markup=message.reply_markup,
+                disable_notification=True
+            )
+        elif message.video:
+            await client.send_video(
+                chat_id=user_id,
+                video=message.video.file_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                reply_markup=message.reply_markup,
+                disable_notification=True
+            )
+        elif message.document:
+            await client.send_document(
+                chat_id=user_id,
+                document=message.document.file_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                reply_markup=message.reply_markup,
+                disable_notification=True
+            )
+        elif message.animation:
+            await client.send_animation(
+                chat_id=user_id,
+                animation=message.animation.file_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                reply_markup=message.reply_markup,
+                disable_notification=True
+            )
+        return True, ""
+
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        return await broadcast_message(client, user_id, message)
+    except (InputUserDeactivated, UserDeactivated):
+        return False, "deactivated"
+    except UserIsBlocked:
+        return False, "blocked"
+    except PeerIdInvalid:
+        return False, "invalid_id"
+    except Exception as e:
+        logger.error(f"Broadcast error for user {user_id}: {str(e)}")
+        return False, f"other:{str(e)}"
+
+async def update_broadcast_status(status_msg: Message, stats: BroadcastStats):
+    """Update the broadcast status message"""
+    try:
+        await status_msg.edit_text(
+            f"🚀 Broadcast in Progress...\n\n"
+            f"👥 Total Users: {stats.total_users}\n"
+            f"✅ Completed: {stats.done} / {stats.total_users}\n"
+            f"✨ Success: {stats.success}\n"
+            f"❌ Failed: {stats.failed}\n\n"
+            f"🚫 Blocked: {stats.blocked}\n"
+            f"❗️ Deleted: {stats.deleted}\n"
+            f"📛 Invalid: {stats.invalid}"
+        )
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+    except Exception as e:
+        logger.error(f"Error updating broadcast status: {str(e)}")
+
+@bot.on_message(filters.command('broadcast') & filters.private)
+async def broadcast_handler(client: Client, message: Message):
+    """Handle the broadcast command"""
+    try:
+        # Check if user is authorized
+        if message.from_user.id != 1949883614:  # Replace with your user ID
+            await message.reply_text("⛔️ This command is only for the bot owner.")
+            return
+
+        # Check if the command is a reply to a message
+        if not message.reply_to_message:
+            await message.reply_text(
+                "❗️ Please reply to a message to broadcast it to all users."
+            )
+            return
+
+        # Initial broadcast status message
+        status_msg = await message.reply_text("🔍 Gathering user data...")
+
+        # Initialize broadcast stats
+        stats = BroadcastStats()
+
+        # Gather unique users from both collections using synchronous operations
+        unique_users = set()
+        
+        # Get users from users_collection
+        for user in users_collection.find({}, {'user_id': 1}):
+            unique_users.add(user['user_id'])
+            
+        # Get users from approved_users_collection
+        for user in approved_users_collection.find({}, {'user_id': 1}):
+            unique_users.add(user['user_id'])
+
+        stats.total_users = len(unique_users)
+        
+        await status_msg.edit_text(
+            f"🚀 Starting broadcast to {stats.total_users} users..."
+        )
+
+        # Process broadcast in chunks to avoid overwhelming the system
+        chunk_size = 20
+        user_chunks = [list(unique_users)[i:i + chunk_size] for i in range(0, len(unique_users), chunk_size)]
+
+        for chunk in user_chunks:
+            broadcast_tasks = []
+            for user_id in chunk:
+                task = asyncio.create_task(broadcast_message(
+                    client,
+                    user_id,
+                    message.reply_to_message
+                ))
+                broadcast_tasks.append((user_id, task))
+
+            # Wait for current chunk to complete
+            for user_id, task in broadcast_tasks:
+                try:
+                    success_status, error = await task
+                    stats.done += 1
+                    
+                    if success_status:
+                        stats.success += 1
+                    else:
+                        stats.update_failed(user_id, error)
+                except Exception as e:
+                    logger.error(f"Task error for user {user_id}: {str(e)}")
+                    stats.update_failed(user_id, f"task_error:{str(e)}")
+
+            # Update status after each chunk
+            await update_broadcast_status(status_msg, stats)
+            await asyncio.sleep(1)  # Small delay between chunks
+
+        # Final broadcast status
+        completion_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        success_rate = (stats.success / stats.total_users) * 100 if stats.total_users > 0 else 0
+        
+        await status_msg.edit_text(
+            f"✅ Broadcast Completed!\n"
+            f"Completed at: {completion_time}\n\n"
+            f"👥 Total Users: {stats.total_users}\n"
+            f"✨ Success: {stats.success}\n"
+            f"❌ Failed: {stats.failed}\n\n"
+            f"Success Rate: {success_rate:.2f}%\n\n"
+            f"🚫 Blocked: {stats.blocked}\n"
+            f"❗️ Deleted: {stats.deleted}\n"
+            f"📛 Invalid: {stats.invalid}"
+        )
+
+        # Clean up invalid users
+        if stats.failed_users:
+            clean_msg = await message.reply_text(
+                "🧹 Cleaning database...\n"
+                "Removing blocked and deleted users."
+            )
+
+            # Extract user IDs from failed_users list
+            invalid_user_ids = [user_id for user_id, _ in stats.failed_users]
+
+            try:
+                # Delete invalid users from both collections
+                deleted_users = users_collection.delete_many(
+                    {"user_id": {"$in": invalid_user_ids}}
+                )
+                deleted_approved = approved_users_collection.delete_many(
+                    {"user_id": {"$in": invalid_user_ids}}
+                )
+
+                total_deleted = deleted_users.deleted_count + deleted_approved.deleted_count
+                
+                await clean_msg.edit_text(
+                    f"🧹 Database cleaned!\n"
+                    f"Removed {total_deleted} invalid users from databases."
+                )
+            except Exception as e:
+                logger.error(f"Error cleaning database: {str(e)}")
+                await clean_msg.edit_text(
+                    "❌ Error occurred while cleaning database."
+                )
 
     except Exception as e:
-        logger.error(f"Error in users status command: {e}")
-        await message.reply_text("❌ An error occurred while fetching user statistics.")
-
-@bot.on_message(filters.command("broadcastgroup") & filters.private)
-async def broadcast_group_handler(client, message: Message):
-    if str(message.from_user.id) != "1949883614":
-        await message.reply_text("⛔️ This command is only for the bot owner.")
-        return
-
-    if not message.reply_to_message:
-        await message.reply_text("❗️ Please reply to a message to broadcast it to all groups.")
-        return
-
-    status_msg = await message.reply_text("🔍 Gathering group data...")
-
-    # Get unique group IDs from both collections
-    unique_groups = set()
-    
-    # Get groups from authorized_chats
-    async for chat in db.authorized_chats.find({"chat_id": {"$lt": 0}}):
-        unique_groups.add(chat['chat_id'])
-    
-    # Get groups from assistant_data
-    async for chat in assistant_data_collection.find({"chat_id": {"$lt": 0}}):
-        unique_groups.add(chat['chat_id'])
-
-    total_groups = len(unique_groups)
-    await status_msg.edit_text(f"🚀 Starting broadcast to {total_groups} groups...")
-
-    done = 0
-    success = 0
-    failed = 0
-    not_found = 0
-    no_access = 0
-    failed_groups = []
-    
-    async def broadcast_to_group(group_id):
-        try:
-            await message.reply_to_message.copy(group_id)
-            return True, None
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            return await broadcast_to_group(group_id)
-        except ChannelInvalid:
-            return False, "not_found"
-        except ChatAdminRequired:
-            return False, "no_access"
-        except Exception as e:
-            return False, str(e)
-
-    for group_id in unique_groups:
-        done += 1
-        success_status, error = await broadcast_to_group(group_id)
-        
-        if success_status:
-            success += 1
-        else:
-            failed += 1
-            failed_groups.append((group_id, error))
-            if error == "not_found":
-                not_found += 1
-            elif error == "no_access":
-                no_access += 1
-
-        if done % 5 == 0:
-            try:
-                await status_msg.edit_text(
-                    f"🚀 Group Broadcast Progress...\n\n"
-                    f"👥 Total Groups: {total_groups}\n"
-                    f"✅ Completed: {done} / {total_groups}\n"
-                    f"✨ Success: {success}\n"
-                    f"❌ Failed: {failed}\n\n"
-                    f"🚫 Not Found: {not_found}\n"
-                    f"⛔️ No Access: {no_access}"
-                )
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-            except Exception:
-                pass
-
-    completion_time = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    await status_msg.edit_text(
-        f"✅ Group Broadcast Completed!\n"
-        f"Completed at: {completion_time}\n\n"
-        f"👥 Total Groups: {total_groups}\n"
-        f"✨ Success: {success}\n"
-        f"❌ Failed: {failed}\n\n"
-        f"Success Rate: {(success/total_groups)*100:.2f}%\n\n"
-        f"🚫 Not Found: {not_found}\n"
-        f"⛔️ No Access: {no_access}"
-    )
-
-    if failed_groups:
-        clean_msg = await message.reply_text("🧹 Cleaning databases...")
-        invalid_group_ids = [group_id for group_id, _ in failed_groups]
-        
-        delete_result1 = await db.authorized_chats.delete_many(
-            {"chat_id": {"$in": invalid_group_ids}}
-        )
-        delete_result2 = await assistant_data_collection.delete_many(
-            {"chat_id": {"$in": invalid_group_ids}}
-        )
-        
-        total_deleted = delete_result1.deleted_count + delete_result2.deleted_count
-        await clean_msg.edit_text(
-            f"🧹 Databases cleaned!\n"
-            f"Removed {total_deleted} invalid group entries."
+        logger.error(f"Error in broadcast handler: {str(e)}")
+        logger.error(traceback.format_exc())
+        await message.reply_text(
+            f"❌ An error occurred during broadcast: {str(e)}"
         )
 
 if __name__ == "__main__":
-    logger.info("Starting bot...")
-    
-    async def start_bot():
-        try:
-            await user.start()
-            logger.info("User client started successfully")
-            
-            # Create the queue processor task
-            queue_processor = asyncio.create_task(process_queue())
-            
-            # Start the bot
-            await bot.start()
-            
-            # Keep the bot running
-            await asyncio.gather(queue_processor)
-            
-        except Exception as e:
-            logger.critical(f"Failed to start bot: {str(e)}")
-            sys.exit(1)
-    
-    # Create and run the event loop
-    loop = asyncio.get_event_loop()
     try:
-        loop.run_until_complete(start_bot())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    finally:
-        # Clean up
-        loop.run_until_complete(asyncio.gather(
-            user.stop(),
-            bot.stop()
-        ))
-        loop.close()
+        logger.info("Starting bot...")
+        
+        # Create the event loop
+        loop = asyncio.get_event_loop()
+        
+        async def start_bot():
+            """Async function to start both user client and bot"""
+            try:
+                # Start user client
+                await user.start()
+                logger.info("User client started successfully")
+                
+                # Start the bot
+                await bot.start()
+                logger.info("Bot started successfully")
+                
+                # Create queue processor task
+                queue_processor_task = asyncio.create_task(start_queue_processor())
+                
+                # Keep the bot running using an infinite loop
+                while True:
+                    await asyncio.sleep(1)
+                    
+            except KeyboardInterrupt:
+                logger.info("Received keyboard interrupt, stopping bot...")
+            except Exception as e:
+                logger.error(f"Error in bot operation: {str(e)}")
+                logger.error(traceback.format_exc())
+            finally:
+                # Cleanup
+                logger.info("Stopping services...")
+                try:
+                    await user.stop()
+                    await bot.stop()
+                except Exception as e:
+                    logger.error(f"Error during cleanup: {str(e)}")
+                
+        # Run everything in the event loop
+        try:
+            loop.run_until_complete(start_bot())
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+        finally:
+            loop.close()
+            logger.info("Bot stopped successfully")
+            
+    except Exception as e:
+        logger.critical(f"Critical error starting bot: {str(e)}")
+        logger.critical(traceback.format_exc())
